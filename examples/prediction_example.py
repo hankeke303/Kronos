@@ -36,17 +36,23 @@ def plot_prediction(kline_df, pred_df):
 
     plt.tight_layout()
     plt.show()
+    plt.savefig("figures/prediction_000001_202512091227_base_small.png")
 
 
 # 1. Load Model and Tokenizer
 tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+# model = Kronos.from_pretrained("./outputs/models/finetune_predictor_demo_test_20251115_0229_finetune_lowlr_smallpredictor/checkpoints/best_model")
+model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
 
 # 2. Instantiate Predictor
-predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+predictor = KronosPredictor(model, tokenizer, device="cuda:1", max_context=512)
 
 # 3. Prepare Data
-df = pd.read_csv("./data/XSHG_5min_600977.csv")
+df = pd.read_csv("../dataForPKU/stock/000906.csv")
+
+df['timestamps'] = df['date']
+df['volume'] = df['volume_post']
+
 df['timestamps'] = pd.to_datetime(df['timestamps'])
 
 lookback = 400
@@ -74,6 +80,10 @@ print(pred_df.head())
 
 # Combine historical and forecasted data for plotting
 kline_df = df.loc[:lookback+pred_len-1]
+
+pd.set_option('display.max_rows', None)
+
+print(f"kline_df: {pred_df}")
 
 # visualize
 plot_prediction(kline_df, pred_df)

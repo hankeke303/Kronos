@@ -7,7 +7,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import trange, tqdm
 from matplotlib import pyplot as plt
 
@@ -23,6 +24,7 @@ from qlib.utils.time import Freq
 sys.path.append("../")
 from config import Config
 from model.kronos import Kronos, KronosTokenizer, auto_regressive_inference
+from utils.training_utils import setup_ddp, cleanup_ddp, set_seed
 
 
 # =================================================================================
@@ -159,9 +161,20 @@ class QlibBacktest:
             "cum_return_w_cost": (report["return"] - report["cost"]).cumsum(),
             "cum_ex_return_w_cost": (report["return"] - report["bench"] - report["cost"]).cumsum(),
         })
+        
+        with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "backtest_results", self.config.backtest_save_folder_name, "output.txt")), 'a') as f:
+            f.write("\n--- Backtest Analysis ---\n")
+            f.write("Benchmark Return:\n")
+            f.write(str(risk_analysis(report["bench"], freq=analysis_freq)))
+            f.write("\n\nExcess Return (w/o cost):\n")
+            f.write(str(analysis["excess_return_without_cost"]))
+            f.write("\n\nExcess Return (w/ cost):\n")
+            f.write(str(analysis["excess_return_with_cost"]))
+            
+            f.write(f"report_df: \n{report_df}\n")
         return report_df
 
-    def run_and_plot_results(self, signals: dict[str, pd.DataFrame]):
+    def run_and_plot_results(self, signals: dict[str, pd.DataFrame], save_path: str):
         """
         Runs backtests for multiple signals and plots the cumulative return curves.
 
@@ -176,6 +189,11 @@ class QlibBacktest:
             pred_series = pred_df.stack()
             pred_series.index.names = ['datetime', 'instrument']
             pred_series = pred_series.swaplevel().sort_index()
+            # 现在的 pred_series 的格式应该是左边有两列，第一列是不同的 instrument，每个 instrument 下面是不同的 datetime 列出，内容只有一栏 score
+            
+            with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "backtest_results", self.config.backtest_save_folder_name, "output.txt")), 'a') as f:
+                f.write(f"\nBacktesting signal: {signal_name}...\n")
+            
             report_df = self.run_single_backtest(pred_series)
 
             return_df[signal_name] = report_df['cum_return_w_cost']
@@ -196,7 +214,9 @@ class QlibBacktest:
         axes[1].set_ylabel("Cumulative Excess Return")
 
         plt.tight_layout()
-        plt.savefig("../figures/backtest_result_example.png", dpi=200)
+        # img_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "figures", "backtest_result_untrained.png"))
+        img_path = save_path
+        plt.savefig(img_path, dpi=200)
         plt.show()
 
 
@@ -204,10 +224,9 @@ class QlibBacktest:
 # 3. Inference Logic
 # =================================================================================
 
-def load_models(config: dict) -> tuple[KronosTokenizer, Kronos]:
+def load_models(config: dict, device: torch.device, rank: int) -> tuple[KronosTokenizer, Kronos]:
     """Loads the fine-tuned tokenizer and predictor model."""
-    device = torch.device(config['device'])
-    print(f"Loading models onto device: {device}...")
+    print(f"[Rank {rank}] Loading models onto device: {device}...")
     tokenizer = KronosTokenizer.from_pretrained(config['tokenizer_path']).to(device).eval()
     model = Kronos.from_pretrained(config['model_path']).to(device).eval()
     return tokenizer, model
@@ -236,34 +255,52 @@ def collate_fn_for_inference(batch):
     return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(timestamps)
 
 
-def generate_predictions(config: dict, test_data: dict) -> dict[str, pd.DataFrame]:
+def generate_predictions(
+    config: dict,
+    test_data: dict,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> dict[str, pd.DataFrame] | None:
     """
     Runs inference on the test dataset to generate prediction signals.
+    When used in a distributed setting, each rank processes a disjoint
+    subset of the data and results are gathered on rank 0.
 
     Args:
         config (dict): A dictionary containing inference parameters.
         test_data (dict): The raw test data loaded from a pickle file.
+        device (torch.device): Device assigned to the current process.
+        rank (int): Global rank of the current process.
+        world_size (int): Total number of processes involved.
 
     Returns:
-        A dictionary where keys are signal types (e.g., 'mean', 'last') and
-        values are DataFrames of predictions (datetime index, symbol columns).
+        dict[str, pd.DataFrame] | None: A dictionary mapping signal names to DataFrames on
+        rank 0; None on all other ranks.
     """
-    tokenizer, model = load_models(config)
-    device = torch.device(config['device'])
+
+    tokenizer, model = load_models(config, device, rank)
 
     # Use the Dataset and DataLoader for efficient batching and processing
     dataset = QlibTestDataset(data=test_data, config=Config())
+    if world_size > 1:
+        indices = list(range(rank, len(dataset), world_size))
+        data_source = Subset(dataset, indices)
+    else:
+        data_source = dataset
+
     loader = DataLoader(
-        dataset,
+        data_source,
         batch_size=config['batch_size'] // config['sample_count'],
         shuffle=False,
         num_workers=os.cpu_count() // 2,
-        collate_fn=collate_fn_for_inference
+        collate_fn=collate_fn_for_inference,
+        pin_memory=True,
     )
 
     results = defaultdict(list)
     with torch.no_grad():
-        for x, x_stamp, y_stamp, symbols, timestamps in tqdm(loader, desc="Inference"):
+        for x, x_stamp, y_stamp, symbols, timestamps in tqdm(loader, desc="Inference", disable=(rank != 0)):
             preds = auto_regressive_inference(
                 tokenizer, model, x.to(device), x_stamp.to(device), y_stamp.to(device),
                 max_context=config['max_context'], pred_len=config['pred_len'], clip=config['clip'],
@@ -285,11 +322,33 @@ def generate_predictions(config: dict, test_data: dict) -> dict[str, pd.DataFram
                 for sig_type, sig_values in signals.items():
                     results[sig_type].append((timestamps[i], symbols[i], sig_values[i]))
 
+    if world_size > 1 and dist.is_initialized():
+        gathered_results = [None] * world_size
+        dist.all_gather_object(gathered_results, results)
+    else:
+        gathered_results = [results]
+
+    if world_size > 1 and dist.is_initialized():
+        dist.barrier()
+
+    if rank != 0:
+        return None
+
+    merged = defaultdict(list)
+    for partial in gathered_results:
+        if not partial:
+            continue
+        for sig_type, records in partial.items():
+            merged[sig_type].extend(records)
+
     print("Post-processing predictions into DataFrames...")
     prediction_dfs = {}
-    for sig_type, records in results.items():
+    for sig_type, records in merged.items():
+        if not records:
+            continue
         df = pd.DataFrame(records, columns=['datetime', 'instrument', 'score'])
         pivot_df = df.pivot_table(index='datetime', columns='instrument', values='score')
+        # 现在的 pivot_df 的格式应该是，左边的 index 是一栏不同的 datetime，所有值的标签是 score，每种值（这里只有 score）下面都按照不同的 instrument 分列
         prediction_dfs[sig_type] = pivot_df.sort_index()
 
     return prediction_dfs
@@ -308,9 +367,19 @@ def main():
     # --- 1. Configuration Setup ---
     base_config = Config()
 
+    ddp_enabled = "WORLD_SIZE" in os.environ
+    if ddp_enabled:
+        rank, world_size, local_rank = setup_ddp()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        device = torch.device(args.device)
+        print(f"Running in single-process mode on device: {device}")
+
+    set_seed(base_config.seed, rank)
+
     # Create a dedicated dictionary for this run's configuration
     run_config = {
-        'device': args.device,
         'data_path': base_config.dataset_path,
         'result_save_path': base_config.backtest_result_path,
         'result_name': base_config.backtest_save_folder_name,
@@ -326,34 +395,75 @@ def main():
         'batch_size': base_config.backtest_batch_size,
     }
 
-    print("--- Running with Configuration ---")
-    for key, val in run_config.items():
-        print(f"{key:>20}: {val}")
-    print("-" * 35)
+    if rank == 0:
+        print("--- Running with Configuration ---")
+        for key, val in run_config.items():
+            print(f"{key:>20}: {val}")
+        print(f"{'device':>20}: {device}")
+        print("-" * 35)
 
     # --- 2. Load Data ---
-    test_data_path = os.path.join(run_config['data_path'], "test_data.pkl")
-    print(f"Loading test data from {test_data_path}...")
-    with open(test_data_path, 'rb') as f:
-        test_data = pickle.load(f)
-    print(test_data)
+    split_paths = [
+        # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
+        ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+    ]
+    split_data = {}
+    for split_name, split_path in split_paths:
+        if rank == 0:
+            print(f"Loading {split_name} data from {split_path}...")
+        with open(split_path, 'rb') as f:
+            split_data[split_name] = pickle.load(f)
+
+    combined_data = {}
+    symbols = set()
+    for data_dict in split_data.values():
+        symbols.update(data_dict.keys())
+    symbols = sorted(symbols)
+
+    for symbol in symbols:
+        frames = []
+        for split_name, _ in split_paths:
+            df = split_data.get(split_name, {}).get(symbol)
+            if df is not None and not df.empty:
+                frames.append(df)
+        if frames:
+            # Keep validation rows ahead of test rows so the series stays continuous.
+            combined_data[symbol] = pd.concat(frames)
+    if rank == 0 and len(split_paths) > 1:
+        print("Data merged")
+
+    test_data = combined_data
+    # if rank == 0:
+    #     print(test_data)
+
     # --- 3. Generate Predictions ---
-    model_preds = generate_predictions(run_config, test_data)
+    model_preds = generate_predictions(run_config, test_data, device, rank, world_size)
+
+    if ddp_enabled and dist.is_initialized():
+        dist.barrier()
+        
+    if rank != 0:
+        return
 
     # --- 4. Save Predictions ---
-    save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
-    os.makedirs(save_dir, exist_ok=True)
-    predictions_file = os.path.join(save_dir, "predictions.pkl")
-    print(f"Saving prediction signals to {predictions_file}...")
-    with open(predictions_file, 'wb') as f:
-        pickle.dump(model_preds, f)
+    if rank == 0 and model_preds:
+        save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
+        os.makedirs(save_dir, exist_ok=True)
+        predictions_file = os.path.join(save_dir, "predictions.pkl")
+        print(f"Saving prediction signals to {predictions_file}...")
+        with open(predictions_file, 'wb') as f:
+            pickle.dump(model_preds, f)
 
     # --- 5. Run Backtesting ---
+    save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
+    predictions_file = os.path.join(save_dir, "predictions.pkl")
     with open(predictions_file, 'rb') as f:
         model_preds = pickle.load(f)
-
+        
     backtester = QlibBacktest(base_config)
-    backtester.run_and_plot_results(model_preds)
+    
+    save_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "figures", f"backtest_result_{base_config.backtest_save_folder_name}.png"))
+    backtester.run_and_plot_results(model_preds, save_path)
 
 
 if __name__ == '__main__':

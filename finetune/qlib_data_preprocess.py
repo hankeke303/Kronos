@@ -19,7 +19,15 @@ class QlibDataPreprocessor:
     def __init__(self):
         """Initializes the preprocessor with configuration and data fields."""
         self.config = Config()
-        self.data_fields = ['open', 'close', 'high', 'low', 'volume', 'vwap']
+        self.data_fields = [
+            "open", "high", "low", "close",
+            "high_limit", "low_limit",
+            "volume_post", "amount", "volume_no",
+            "ma_tt_5", "ma_tt_10", "ma_tt_20", "ma_tt_60", "ma_tt_120",
+            "rsi_tt_3", "rsi_tt_6", "rsi_tt_12", "rsi_tt_14",
+            "macd_tt_dif", "macd_tt_dea", "macd_tt_macd",
+            "flag", "is_st"
+        ]
         self.data = {}  # A dictionary to store processed data for each symbol.
 
     def initialize_qlib(self):
@@ -69,10 +77,13 @@ class QlibDataPreprocessor:
             symbol_df = symbol_df.reset_index().rename(columns={'level_1': 'field'})
             symbol_df = pd.pivot(symbol_df, index='datetime', columns='field', values=symbol)
             symbol_df = symbol_df.rename(columns={f'${field}': field for field in self.data_fields})
+            
+            # print(symbol_df)
 
             # Calculate amount and select final features.
-            symbol_df['vol'] = symbol_df['volume']
-            symbol_df['amt'] = (symbol_df['open'] + symbol_df['high'] + symbol_df['low'] + symbol_df['close']) / 4 * symbol_df['vol']
+            symbol_df['vol'] = symbol_df['volume_post']
+            # symbol_df['amt'] = (symbol_df['open'] + symbol_df['high'] + symbol_df['low'] + symbol_df['close']) / 4 * symbol_df['vol']
+            symbol_df['amt'] = symbol_df['amount']
             symbol_df = symbol_df[self.config.feature_list]
 
             # Filter out symbols with insufficient data.

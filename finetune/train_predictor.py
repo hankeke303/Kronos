@@ -3,6 +3,7 @@ import sys
 import json
 import time
 from time import gmtime, strftime
+import argparse
 import torch.distributed as dist
 import torch
 from torch.utils.data import DataLoader
@@ -74,11 +75,12 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         betas=(config['adam_beta1'], config['adam_beta2']),
         weight_decay=config['adam_weight_decay']
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=config['predictor_learning_rate'],
-        steps_per_epoch=len(train_loader), epochs=config['epochs'],
-        pct_start=0.03, div_factor=10
-    )
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer, max_lr=config['predictor_learning_rate'],
+    #     steps_per_epoch=len(train_loader), epochs=config['epochs'],
+    #     pct_start=0.03, div_factor=10
+    # )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0)
 
     best_val_loss = float('inf')
     dt_result = {}
@@ -91,6 +93,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
         train_dataset.set_epoch_seed(epoch_idx * 10000 + rank)
         valid_dataset.set_epoch_seed(0)
+        
+        num_iters = len(train_loader)
 
         for i, (batch_x, batch_x_stamp) in enumerate(train_loader):
             batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
@@ -113,7 +117,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             optimizer.step()
-            scheduler.step()
+            # scheduler.step()
+            scheduler.step(epoch_idx + i / num_iters)
 
             # Logging (Master Process Only)
             if rank == 0 and (batch_idx_global + 1) % config['log_interval'] == 0:
@@ -179,7 +184,13 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
     return dt_result
 
 
-def main(config: dict):
+def _build_predictor_from_scratch(config: dict) -> Kronos:
+    return Kronos(
+        **config["predictor_model_initialize_params"]
+    )
+
+
+def main(config: dict, mode: str = 'finetune', init: str = 'pretrained', tokenizer_path_override: str | None = None, predictor_path_override: str | None = None, save_folder_name_override: str | None = None):
     """Main function to orchestrate the DDP training process."""
     rank, world_size, local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
@@ -212,8 +223,11 @@ def main(config: dict):
     # Model Initialization
     tokenizer = KronosTokenizer.from_pretrained(config['finetuned_tokenizer_path'])
     tokenizer.eval().to(device)
-
-    model = Kronos.from_pretrained(config['pretrained_predictor_path'])
+    if init == 'scratch':
+        model = _build_predictor_from_scratch(config)
+    else:
+        load_path = predictor_path_override or config['pretrained_predictor_path']
+        model = Kronos.from_pretrained(load_path)
     model.to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
@@ -236,9 +250,24 @@ def main(config: dict):
 
 
 if __name__ == '__main__':
-    # Usage: torchrun --standalone --nproc_per_node=NUM_GPUS train_predictor.py
+    # Usage: torchrun --standalone --nproc_per_node=NUM_GPUS train_predictor.py [--mode pretrain|finetune] [--init pretrained|scratch]
     if "WORLD_SIZE" not in os.environ:
         raise RuntimeError("This script must be launched with `torchrun`.")
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['pretrain', 'finetune'], default='finetune')
+    parser.add_argument('--init', choices=['pretrained', 'scratch'], default='pretrained')
+    parser.add_argument('--tokenizer_path', type=str, default=None, help='Override tokenizer path/id')
+    parser.add_argument('--predictor_path', type=str, default=None, help='Override predictor pretrained path/id')
+    parser.add_argument('--save_folder_name', type=str, default=None, help='Override save folder name')
+    args, _ = parser.parse_known_args()
+
     config_instance = Config()
-    main(config_instance.__dict__)
+    main(
+        config_instance.__dict__,
+        mode=args.mode,
+        init=args.init,
+        tokenizer_path_override=args.tokenizer_path,
+        predictor_path_override=args.predictor_path,
+        save_folder_name_override=args.save_folder_name,
+    )
