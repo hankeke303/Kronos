@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_202512170241_predictor_12feature_14bit-9_tokloss0.0056_cosinelr"
+        self.run_id = "test_202512171035_predictor_12feature_14bit-8_tokloss0.0056-base"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"
@@ -69,16 +69,16 @@ class Config:
 
         self.epochs = 250
         self.log_interval = 100  # Log training status every N batches.
-        self.batch_size = 200  # Batch size per GPU.
+        self.batch_size = 400  # Batch size per GPU.
 
         # Number of samples to draw for one "epoch" of training/validation.
         # This is useful for large datasets where a true epoch is too long.
-        self.n_train_iter = 40000 * self.batch_size
-        self.n_val_iter = 800 * self.batch_size
+        self.n_train_iter = 20000 * self.batch_size
+        self.n_val_iter = 400 * self.batch_size
 
         # Learning rates for different model components.
         self.tokenizer_learning_rate = 5e-6
-        self.predictor_learning_rate = 1e-6
+        self.predictor_learning_rate = 3e-6
 
         # Gradient accumulation to simulate a larger batch size.
         self.accumulation_steps = 1
@@ -86,7 +86,7 @@ class Config:
         # AdamW optimizer parameters.
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.95
-        self.adam_weight_decay = 0.4
+        self.adam_weight_decay = 0.5
 
         # Miscellaneous
         self.seed = 100  # Global random seed for reproducibility.
@@ -141,17 +141,17 @@ class Config:
         #     "token_dropout_p": 0.0
         # } # base predictor 的参数
         self.predictor_model_initialize_params = {
-            "attn_dropout_p": 0.1,
+            "attn_dropout_p": 0.15,
             "d_model": 512,
             "ff_dim": 1024,
-            "ffn_dropout_p": 0.25,
+            "ffn_dropout_p": 0.30,
             "learn_te": True,
             "n_heads": 8,
             "n_layers": 8,
-            "resid_dropout_p": 0.25,
+            "resid_dropout_p": 0.30,
             "s1_bits": 14,
             "s2_bits": 14,
-            "token_dropout_p": 0.1
+            "token_dropout_p": 0.15
         }
 
         # =================================================================

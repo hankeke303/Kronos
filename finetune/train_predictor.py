@@ -75,12 +75,12 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         betas=(config['adam_beta1'], config['adam_beta2']),
         weight_decay=config['adam_weight_decay']
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=config['predictor_learning_rate'],
-        steps_per_epoch=len(train_loader), epochs=config['epochs'],
-        pct_start=0.03, div_factor=10
-    )
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0)
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer, max_lr=config['predictor_learning_rate'],
+    #     steps_per_epoch=len(train_loader), epochs=config['epochs'],
+    #     pct_start=0.03, div_factor=10
+    # )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0)
 
     best_val_loss = float('inf')
     dt_result = {}
@@ -117,8 +117,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             optimizer.step()
-            scheduler.step()
-            # scheduler.step(epoch_idx + i / num_iters)
+            # scheduler.step()
+            scheduler.step(epoch_idx + i / num_iters)
 
             # Logging (Master Process Only)
             if rank == 0 and (batch_idx_global + 1) % config['log_interval'] == 0:
