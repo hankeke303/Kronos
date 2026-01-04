@@ -10,7 +10,7 @@ class Config:
         # Data & Feature Parameters
         # =================================================================
         # TODO: Update this path to your Qlib data directory.
-        self.qlib_data_path = "../qlib_data/dataForPKU/"
+        self.qlib_data_path = "../qlib_data/dataForPKU-2/"
         self.instrument = 'all'
         
         # self.run_id = "test_20251118_1806_scratch_new-dataset"
@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_202501020446_重跑一遍之前12feat14bit的模型-2"
+        self.run_id = "test_202512310208_predictor_w_tokenizer12270306_lr2.5e-6_batch200_decay0.4"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"
@@ -35,6 +35,16 @@ class Config:
 
         # Features to be used from the raw data.
         # self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
+        # self.feature_list = [
+        #     "open", "high", "low", "close",
+        #     # "high_limit", "low_limit",
+        #     "vol", "amt",
+        #     "ma_tt_5", "ma_tt_10", # "ma_tt_20", "ma_tt_60", "ma_tt_120",
+        #     "rsi_tt_3", "rsi_tt_6", # "rsi_tt_12", "rsi_tt_14",
+        #     # "macd_tt_dif", "macd_tt_dea", "macd_tt_macd",
+        #     "macd_tt_dif", "macd_tt_macd",
+        #     # "flag", "is_st"
+        # ]
         self.feature_list = [
             "open", "high", "low", "close",
             # "high_limit", "low_limit",
@@ -43,8 +53,12 @@ class Config:
             "rsi_tt_3", "rsi_tt_6", # "rsi_tt_12", "rsi_tt_14",
             # "macd_tt_dif", "macd_tt_dea", "macd_tt_macd",
             "macd_tt_dif", "macd_tt_macd",
-            # "flag", "is_st"
+            # "flag", "is_st",
+            "index_rank", "stock_rank", "hy_changeRatio",
+            "zt_ratio", "dt_ratio", "up_ratio", "down_ratio",
+            "SH_close", "SZ_close", "SH_zhenfu", "SZ_zhenfu",
         ]
+        # self.feature_list = ["open", "high", "low", "close", "high_limit", "low_limit", "vol", "amt", "volume_no", "ma_tt_5", "ma_tt_10", "ma_tt_20", "ma_tt_60", "ma_tt_120", "rsi_tt_3", "rsi_tt_6", "rsi_tt_12", "rsi_tt_14", "macd_tt_dif", "macd_tt_dea", "macd_tt_macd", "boll_tt_upper", "boll_tt_lower", "RSV_3", "RSV_5", "RSV_10", "RSV_20", "RSV_30", "RSV_60", "RSV_120", "MAX_3", "MAX_5", "MAX_10", "MAX_20", "MAX_30", "MAX_60", "MAX_120", "MIN_3", "MIN_5", "MIN_10", "MIN_20", "MIN_30", "MIN_60", "MIN_120", "ATR_3", "ATR_5", "ATR_10", "ATR_20", "ATR_60", "ATR_120", "circulating_market_cap", "circulating_cap", "amount_ratio", "hy_open", "hy_high", "hy_low", "hy_close", "hy_volume", "hycode", "index_rank", "stock_rank", "index_member_count", "hy_changeRatio", "SH_close", "SZ_close", "CYB_close", "HS_close", "ZZ_close", "SH_zhenfu", "SZ_zhenfu", "CYB_zhenfu", "HS_zhenfu", "ZZ_zhenfu", "SH_tb_ma5", "SZ_tb_ma5", "CYB_tb_ma5", "HS_tb_ma5", "ZZ_tb_ma5", "SH_tb_ma20", "SZ_tb_ma20", "CYB_tb_ma20", "HS_tb_ma20", "ZZ_tb_ma20", "SH_tb_ma60", "SZ_tb_ma60", "CYB_tb_ma60", "HS_tb_ma60", "ZZ_tb_ma60", "SH_tb_ma120", "SZ_tb_ma120", "CYB_tb_ma120", "HS_tb_ma120", "ZZ_tb_ma120", "SH_volume", "SZ_volume", "CYB_volume", "HS_volume", "ZZ_volume", "SH_amount", "SZ_amount", "CYB_amount", "HS_amount", "ZZ_amount", "upbi0", "upbi3", "upbi6", "zt_ratio", "dt_ratio", "up_ratio", "down_ratio", "flag", "is_st"]
         # Time-based features to be generated.
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
 
@@ -59,7 +73,7 @@ class Config:
         self.backtest_time_range = ["2024-07-01", "2025-11-06"]
 
         # TODO: Directory to save the processed, pickled datasets.
-        self.dataset_path = "./data/processed_datasets_origin"
+        self.dataset_path = "./data/processed_datasets_110"
         # self.dataset_path = "./data/processed_datasets_cleaned_6"
 
         # =================================================================
@@ -69,16 +83,19 @@ class Config:
 
         self.epochs = 250
         self.log_interval = 100  # Log training status every N batches.
-        self.batch_size = 400  # Batch size per GPU.
+        self.batch_size = 200  # Batch size per GPU.
+
+        # Early stopping patience: stop if val loss does not improve for N epochs.
+        self.early_stop_patience = 10
 
         # Number of samples to draw for one "epoch" of training/validation.
         # This is useful for large datasets where a true epoch is too long.
         self.n_train_iter = 20000 * self.batch_size
-        self.n_val_iter = 400 * self.batch_size
+        self.n_val_iter = 800 * self.batch_size
 
         # Learning rates for different model components.
-        self.tokenizer_learning_rate = 1e-5
-        self.predictor_learning_rate = 4e-5
+        self.tokenizer_learning_rate = 2.5e-6
+        self.predictor_learning_rate = 2.5e-6
 
         # Gradient accumulation to simulate a larger batch size.
         self.accumulation_steps = 1
@@ -86,47 +103,47 @@ class Config:
         # AdamW optimizer parameters.
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.95
-        self.adam_weight_decay = 0.1
+        self.adam_weight_decay = 0.4
 
         # Miscellaneous
         self.seed = 100  # Global random seed for reproducibility.
         
-        # self.tokenizer_model_initialize_params = {
-        #     "attn_dropout_p": 0.0,
-        #     "beta": 0.05,
-        #     "d_in": 20,
-        #     "d_model": 256,
-        #     "ff_dim": 512,
-        #     "ffn_dropout_p": 0.0,
-        #     "gamma": 1.1,
-        #     "gamma0": 1.0,
-        #     "group_size": 4,
-        #     "n_dec_layers": 4,
-        #     "n_enc_layers": 4,
-        #     "n_heads": 4,
-        #     "resid_dropout_p": 0.0,
-        #     "s1_bits": 10,
-        #     "s2_bits": 10,
-        #     "zeta": 0.05
-        # }
         self.tokenizer_model_initialize_params = {
             "attn_dropout_p": 0.0,
             "beta": 0.05,
-            "d_in": 12,
-            "d_model": 512,
-            "ff_dim": 1024,
+            "d_in": 23,
+            "d_model": 256,
+            "ff_dim": 512,
             "ffn_dropout_p": 0.0,
             "gamma": 1.1,
             "gamma0": 1.0,
             "group_size": 4,
-            "n_dec_layers": 5,
-            "n_enc_layers": 5,
-            "n_heads": 8,
+            "n_dec_layers": 4,
+            "n_enc_layers": 4,
+            "n_heads": 4,
             "resid_dropout_p": 0.0,
             "s1_bits": 14,
             "s2_bits": 14,
             "zeta": 0.05
         }
+        # self.tokenizer_model_initialize_params = {
+        #     "attn_dropout_p": 0.0,
+        #     "beta": 0.05,
+        #     "d_in": 23,
+        #     "d_model": 512,
+        #     "ff_dim": 1024,
+        #     "ffn_dropout_p": 0.0,
+        #     "gamma": 1.1,
+        #     "gamma0": 1.0,
+        #     "group_size": 4,
+        #     "n_dec_layers": 5,
+        #     "n_enc_layers": 5,
+        #     "n_heads": 8,
+        #     "resid_dropout_p": 0.0,
+        #     "s1_bits": 14,
+        #     "s2_bits": 14,
+        #     "zeta": 0.05
+        # }
         # self.predictor_model_initialize_params = {
         #     "attn_dropout_p": 0.0,
         #     "d_model": 832,
@@ -149,8 +166,8 @@ class Config:
             "n_heads": 8,
             "n_layers": 8,
             "resid_dropout_p": 0.25,
-            "s1_bits": 15,
-            "s2_bits": 15,
+            "s1_bits": 14,
+            "s2_bits": 14,
             "token_dropout_p": 0.1
         }
 
@@ -184,17 +201,17 @@ class Config:
         # TODO: Update these paths to your pretrained model locations.
         # These can be local paths or Hugging Face Hub model identifiers.
         self.pretrained_tokenizer_path = "NeoQuasar/Kronos-Tokenizer-base"
-        # self.pretrained_tokenizer_path = "./outputs/models/finetune_tokenizer_demo_test_20251128_2002_tokenizer_s1bit12-2/checkpoints/best_model"
-        self.pretrained_predictor_path = "NeoQuasar/Kronos-small"
+        # self.pretrained_tokenizer_path = "./outputs/models/finetune_tokenizer_demo_test_20251202_1352_tokenizer_12feature_14bit/checkpoints/best_model"
+        self.pretrained_predictor_path = "./outputs/models/finetune_predictor_demo_test_202512142358_predictor_12feature_14bit-5_tokloss0.0056/checkpoints/best_model"
 
         # Paths to the fine-tuned models, derived from the save_path.
         # These will be generated automatically during training.
         # self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
         # self.finetuned_tokenizer_path = "NeoQuasar/Kronos-Tokenizer-base"
-        self.finetuned_tokenizer_path = "./outputs/models/finetune_tokenizer_demo_test_20251123_1852_new-model-params-5/checkpoints/best_model"
-        # self.finetuned_predictor_path = f"{self.save_path}/{self.predictor_save_folder_name}/checkpoints/best_model"
+        self.finetuned_tokenizer_path = "outputs/models/finetune_tokenizer_demo_test_202512270306_tokenizer_23_lr5e-6_decay0.3_batch200/checkpoints/best_model"
+        self.finetuned_predictor_path = f"{self.save_path}/{self.predictor_save_folder_name}/checkpoints/best_model"
         # self.finetuned_predictor_path = "NeoQuasar/Kronos-base"
-        self.finetuned_predictor_path = "./outputs/models/finetune_predictor_demo_test_20251126_0918_train_predictor_with_new_tokenizer_scratch/checkpoints/best_model"
+        # self.finetuned_predictor_path = "./outputs/models/finetune_predictor_demo_test_202512142358_predictor_12feature_14bit-5_tokloss0.0056/checkpoints/best_model"
 
         self.n_fast_test_iter = self.batch_size * 1000
         

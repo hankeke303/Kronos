@@ -112,8 +112,12 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=0)
 
     best_val_loss = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    patience_limit = config.get('early_stop_patience', 999999)
     dt_result = {}
     batch_idx_global_train = 0
+    epochs_ran = 0
 
     for epoch_idx in range(config['epochs']):
         epoch_start_time = time.time()
@@ -207,15 +211,33 @@ def train_model(model, device, config, save_dir, logger, rank, world_size):
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
+                best_epoch = epoch_idx + 1
+                patience_counter = 0
                 save_path = f"{save_dir}/checkpoints/best_model"
                 model.module.save_pretrained(save_path)
                 print(f"Best model saved to {save_path} (Val Loss: {best_val_loss:.4f})")
                 if logger:
                     logger.log_model("best_model", save_path)
+            else:
+                patience_counter += 1
+
+            stop_tensor = torch.tensor(int(patience_counter >= patience_limit), device=device)
+        else:
+            stop_tensor = torch.tensor(0, device=device)
+
+        dist.broadcast(stop_tensor, src=0)
+        epochs_ran = epoch_idx + 1
+        if stop_tensor.item():
+            if rank == 0:
+                print(f"Early stopping triggered after {epochs_ran} epochs (patience={patience_limit}).")
+            break
 
         dist.barrier()  # Ensure all processes finish the epoch before starting the next one.
 
     dt_result['best_val_loss'] = best_val_loss
+    dt_result['best_epoch'] = best_epoch
+    dt_result['stopped_early'] = bool(patience_counter >= patience_limit)
+    dt_result['epochs_ran'] = epochs_ran
     return model, dt_result
 
 

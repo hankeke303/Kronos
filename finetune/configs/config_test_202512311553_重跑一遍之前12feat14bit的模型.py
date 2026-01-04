@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_202501020446_重跑一遍之前12feat14bit的模型-2"
+        self.run_id = "test_202512311553_重跑一遍之前12feat14bit的模型"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"

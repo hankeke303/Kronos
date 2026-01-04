@@ -19,15 +19,7 @@ class QlibDataPreprocessor:
     def __init__(self):
         """Initializes the preprocessor with configuration and data fields."""
         self.config = Config()
-        self.data_fields = [
-            "open", "high", "low", "close",
-            "high_limit", "low_limit",
-            "volume_post", "amount", "volume_no",
-            "ma_tt_5", "ma_tt_10", "ma_tt_20", "ma_tt_60", "ma_tt_120",
-            "rsi_tt_3", "rsi_tt_6", "rsi_tt_12", "rsi_tt_14",
-            "macd_tt_dif", "macd_tt_dea", "macd_tt_macd",
-            "flag", "is_st"
-        ]
+        self.data_fields = ["open", "high", "low", "close", "high_limit", "low_limit", "volume_post", "amount", "volume_no", "ma_tt_5", "ma_tt_10", "ma_tt_20", "ma_tt_60", "ma_tt_120", "rsi_tt_3", "rsi_tt_6", "rsi_tt_12", "rsi_tt_14", "macd_tt_dif", "macd_tt_dea", "macd_tt_macd", "boll_tt_upper", "boll_tt_lower", "RSV_3", "RSV_5", "RSV_10", "RSV_20", "RSV_30", "RSV_60", "RSV_120", "MAX_3", "MAX_5", "MAX_10", "MAX_20", "MAX_30", "MAX_60", "MAX_120", "MIN_3", "MIN_5", "MIN_10", "MIN_20", "MIN_30", "MIN_60", "MIN_120", "ATR_3", "ATR_5", "ATR_10", "ATR_20", "ATR_60", "ATR_120", "circulating_market_cap", "circulating_cap", "amount_ratio", "hy_open", "hy_high", "hy_low", "hy_close", "hy_volume", "hycode", "index_rank", "stock_rank", "index_member_count", "hy_changeRatio", "SH_close", "SZ_close", "CYB_close", "HS_close", "ZZ_close", "SH_zhenfu", "SZ_zhenfu", "CYB_zhenfu", "HS_zhenfu", "ZZ_zhenfu", "SH_tb_ma5", "SZ_tb_ma5", "CYB_tb_ma5", "HS_tb_ma5", "ZZ_tb_ma5", "SH_tb_ma20", "SZ_tb_ma20", "CYB_tb_ma20", "HS_tb_ma20", "ZZ_tb_ma20", "SH_tb_ma60", "SZ_tb_ma60", "CYB_tb_ma60", "HS_tb_ma60", "ZZ_tb_ma60", "SH_tb_ma120", "SZ_tb_ma120", "CYB_tb_ma120", "HS_tb_ma120", "ZZ_tb_ma120", "SH_volume", "SZ_volume", "CYB_volume", "HS_volume", "ZZ_volume", "SH_amount", "SZ_amount", "CYB_amount", "HS_amount", "ZZ_amount", "upbi0", "upbi3", "upbi6", "zt_ratio", "dt_ratio", "up_ratio", "down_ratio", "flag", "is_st"]
         self.data = {}  # A dictionary to store processed data for each symbol.
 
     def initialize_qlib(self):
