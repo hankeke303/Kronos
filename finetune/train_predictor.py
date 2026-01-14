@@ -4,6 +4,7 @@ import json
 import time
 from time import gmtime, strftime
 import argparse
+import csv
 import torch.distributed as dist
 import torch
 from torch.utils.data import DataLoader
@@ -42,10 +43,12 @@ def create_dataloaders(config: dict, rank: int, world_size: int):
     print(f"[Rank {rank}] Creating distributed dataloaders...")
     train_dataset = QlibDataset('train')
     valid_dataset = QlibDataset('val')
+    test_dataset = QlibDataset('test')
     print(f"[Rank {rank}] Train dataset size: {len(train_dataset)}, Validation dataset size: {len(valid_dataset)}")
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
     train_loader = DataLoader(
         train_dataset, batch_size=config['batch_size'], sampler=train_sampler,
@@ -55,7 +58,11 @@ def create_dataloaders(config: dict, rank: int, world_size: int):
         valid_dataset, batch_size=config['batch_size'], sampler=val_sampler,
         num_workers=config.get('num_workers', 2), pin_memory=True, drop_last=False
     )
-    return train_loader, val_loader, train_dataset, valid_dataset
+    test_loader = DataLoader(
+        test_dataset, batch_size=config['batch_size'], sampler=test_sampler,
+        num_workers=config.get('num_workers', 2), pin_memory=True, drop_last=False
+    )
+    return train_loader, val_loader, test_loader, train_dataset, valid_dataset, test_dataset
 
 
 def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_size):
@@ -67,7 +74,7 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         effective_bs = config['batch_size'] * world_size
         print(f"Effective BATCHSIZE per GPU: {config['batch_size']}, Total: {effective_bs}")
 
-    train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders(config, rank, world_size)
+    train_loader, val_loader, test_loader, train_dataset, valid_dataset, test_dataset = create_dataloaders(config, rank, world_size)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -90,6 +97,7 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
     batch_idx_global = 0
     epochs_ran = 0
 
+    metrics_csv_path = os.path.join(save_dir, "metrics.csv")
     for epoch_idx in range(config['epochs']):
         epoch_start_time = time.time()
         model.train()
@@ -97,8 +105,10 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
         train_dataset.set_epoch_seed(epoch_idx * 10000 + rank)
         valid_dataset.set_epoch_seed(0)
+        test_dataset.set_epoch_seed(0)
         
         num_iters = len(train_loader)
+        epoch_train_loss_sum = 0.0
 
         for i, (batch_x, batch_x_stamp) in enumerate(train_loader):
             batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
@@ -125,15 +135,17 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
             scheduler.step(epoch_idx + i / num_iters)
 
             # Logging (Master Process Only)
+            batch_loss_value = loss.item()
+            epoch_train_loss_sum += batch_loss_value
             if rank == 0 and (batch_idx_global + 1) % config['log_interval'] == 0:
                 lr = optimizer.param_groups[0]['lr']
                 print(
                     f"[Rank {rank}, Epoch {epoch_idx + 1}/{config['epochs']}, Step {i + 1}/{len(train_loader)}] "
-                    f"LR {lr:.6f}, Loss: {loss.item():.4f}"
+                    f"LR {lr:.6f}, Loss: {batch_loss_value:.4f}"
                 )
             if rank == 0 and logger:
                 lr = optimizer.param_groups[0]['lr']
-                logger.log_metric('train_predictor_loss_batch', loss.item(), step=batch_idx_global)
+                logger.log_metric('train_predictor_loss_batch', batch_loss_value, step=batch_idx_global)
                 logger.log_metric('train_S1_loss_each_batch', s1_loss.item(), step=batch_idx_global)
                 logger.log_metric('train_S2_loss_each_batch', s2_loss.item(), step=batch_idx_global)
                 logger.log_metric('predictor_learning_rate', lr, step=batch_idx_global)
@@ -167,14 +179,50 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
         avg_val_loss = val_loss_sum_tensor.item() / val_batches_tensor.item() if val_batches_tensor.item() > 0 else 0
 
+        # --- Test Loop (no console output) ---
+        tot_test_loss_sum_rank = 0.0
+        test_batches_processed_rank = 0
+        with torch.no_grad():
+            for batch_x, batch_x_stamp in test_loader:
+                batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.squeeze(0).to(device, non_blocking=True)
+
+                token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+                token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
+                token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
+
+                logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                test_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+
+                tot_test_loss_sum_rank += test_loss.item()
+                test_batches_processed_rank += 1
+
+        test_loss_sum_tensor = torch.tensor(tot_test_loss_sum_rank, device=device)
+        test_batches_tensor = torch.tensor(test_batches_processed_rank, device=device)
+        dist.all_reduce(test_loss_sum_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(test_batches_tensor, op=dist.ReduceOp.SUM)
+        avg_test_loss = test_loss_sum_tensor.item() / test_batches_tensor.item() if test_batches_tensor.item() > 0 else 0
+
+        # --- Aggregate train loss across ranks ---
+        train_loss_sum_tensor = torch.tensor(epoch_train_loss_sum, device=device)
+        dist.all_reduce(train_loss_sum_tensor, op=dist.ReduceOp.SUM)
+        avg_train_loss = train_loss_sum_tensor.item() / (num_iters * world_size) if num_iters > 0 else 0
+
+        current_lr = optimizer.param_groups[0]['lr']
+
         # --- End of Epoch Summary & Checkpointing (Master Process Only) ---
         if rank == 0:
             print(f"\n--- Epoch {epoch_idx + 1}/{config['epochs']} Summary ---")
+            print(f"Train Loss: {avg_train_loss:.4f}")
             print(f"Validation Loss: {avg_val_loss:.4f}")
             print(f"Time This Epoch: {format_time(time.time() - epoch_start_time)}")
             print(f"Total Time Elapsed: {format_time(time.time() - start_time)}\n")
+
             if logger:
+                logger.log_metric('train_predictor_loss_epoch', avg_train_loss, epoch=epoch_idx)
                 logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
+                logger.log_metric('test_predictor_loss_epoch', avg_test_loss, epoch=epoch_idx)
+                # logger.log_metric('predictor_learning_rate_epoch', current_lr, epoch=epoch_idx)
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -186,6 +234,15 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
             else:
                 patience_counter += 1
+
+            # Save metrics to CSV after each epoch (append mode)
+            header = ['epoch', 'learning_rate', 'train_loss', 'val_loss', 'test_loss']
+            file_exists = os.path.exists(metrics_csv_path)
+            with open(metrics_csv_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                if not file_exists:
+                    writer.writerow(header)
+                writer.writerow([epoch_idx + 1, current_lr, avg_train_loss, avg_val_loss, avg_test_loss])
 
             stop_tensor = torch.tensor(int(patience_counter >= patience_limit), device=device)
         else:

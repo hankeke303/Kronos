@@ -26,6 +26,7 @@ from config import Config
 from model.kronos import Kronos, KronosTokenizer, auto_regressive_inference
 from utils.training_utils import setup_ddp, cleanup_ddp, set_seed
 
+from finetune.dataset import calc_extra_features
 
 # =================================================================================
 # 1. Data Loading and Processing for Inference
@@ -48,6 +49,8 @@ class QlibTestDataset(Dataset):
         self.feature_list = config.feature_list
         self.time_feature_list = config.time_feature_list
         self.indices = []
+        
+        self.data = calc_extra_features(self.data)
 
         print("Preprocessing and building indices for test dataset...")
         for symbol in self.symbols:

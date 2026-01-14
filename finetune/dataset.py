@@ -1,10 +1,39 @@
 import pickle
 import random
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from config import Config
 
+def calc_extra_features(data):
+    """
+    Add return-based features to data loaded from pickled files.
+
+    Accepts either a single DataFrame or a symbol->DataFrame dictionary. The
+    first row is removed because it lacks a previous value to compare against.
+    """
+
+    def _augment(df: pd.DataFrame) -> pd.DataFrame:
+        required_cols = ["open", "close", "hy_open", "hy_close"]
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            raise KeyError(f"Missing required columns for return calc: {missing}")
+
+        df = df.copy()
+        # Simple arithmetic returns: (today - yesterday) / yesterday.
+        df["open_return"] = df["open"].pct_change()
+        df["close_return"] = df["close"].pct_change()
+        df["hy_open_return"] = df["hy_open"].pct_change()
+        df["hy_close_return"] = df["hy_close"].pct_change()
+
+        # Drop the first record that has NaN returns.
+        return df.iloc[1:].copy()
+
+    if isinstance(data, dict):
+        return {symbol: _augment(df) for symbol, df in data.items()}
+
+    return _augment(data)
 
 class QlibDataset(Dataset):
     """
@@ -22,8 +51,8 @@ class QlibDataset(Dataset):
 
     def __init__(self, data_type: str = 'train'):
         self.config = Config()
-        if data_type not in ['train', 'val']:
-            raise ValueError("data_type must be 'train' or 'val'")
+        if data_type not in ['train', 'val', 'test']:
+            raise ValueError("data_type must be 'train', 'val' or 'test'")
         self.data_type = data_type
 
         # Use a dedicated random number generator for sampling to avoid
@@ -34,12 +63,16 @@ class QlibDataset(Dataset):
         if data_type == 'train':
             self.data_path = f"{self.config.dataset_path}/train_data.pkl"
             self.n_samples = self.config.n_train_iter
-        else:
+        elif data_type == 'val':
             self.data_path = f"{self.config.dataset_path}/val_data.pkl"
+            self.n_samples = self.config.n_val_iter
+        else:
+            self.data_path = f"{self.config.dataset_path}/test_data.pkl"
             self.n_samples = self.config.n_val_iter
 
         with open(self.data_path, 'rb') as f:
             self.data = pickle.load(f)
+            self.data = calc_extra_features(self.data)
 
         self.window = self.config.lookback_window + self.config.predict_window + 1
 
