@@ -76,3 +76,6 @@ tmp/
 
 outputs/
 data/
+
+Kronos-models/
+figures/backtest_result_*.png

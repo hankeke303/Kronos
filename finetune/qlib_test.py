@@ -313,13 +313,23 @@ def generate_predictions(
             preds = preds[:, -config['pred_len']:, :]
 
             # The 'close' price is at index 3 in `feature_list`
-            last_day_close = x[:, -1, 3].numpy()
-            signals = {
-                'last': preds[:, -1, 3] - last_day_close,
-                'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
-                'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
-                'min': np.min(preds[:, :, 3], axis=1) - last_day_close,
-            }
+            if config['backtest_pred'] == 'close':
+                last_day_close = x[:, -1, 3].numpy()
+                signals = {
+                    'last': preds[:, -1, 3] - last_day_close,
+                    'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
+                    'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
+                    'min':
+                     np.min(preds[:, :, 3], axis=1) - last_day_close,
+                }
+            elif config['backtest_pred'] == 'close_return':
+                cum_close_return = preds[:, :, 9].cumsum(axis=1)
+                signals = {
+                    'last': cum_close_return[:, -1],
+                    'mean': np.mean(cum_close_return, axis=1),
+                    'max': np.max(cum_close_return, axis=1),
+                    'min': np.min(cum_close_return, axis=1),
+                }
 
             for i in range(len(symbols)):
                 for sig_type, sig_values in signals.items():
@@ -396,6 +406,10 @@ def main():
         'top_p': base_config.inference_top_p,
         'sample_count': base_config.inference_sample_count,
         'batch_size': base_config.backtest_batch_size,
+        # =================================================================
+        # New added by ZMJ
+        # =================================================================
+        'backtest_pred': base_config.backtest_pred,
     }
 
     if rank == 0:
@@ -405,57 +419,57 @@ def main():
         print(f"{'device':>20}: {device}")
         print("-" * 35)
 
-    # # --- 2. Load Data ---
-    # split_paths = [
-    #     # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
-    #     ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
-    # ]
-    # split_data = {}
-    # for split_name, split_path in split_paths:
-    #     if rank == 0:
-    #         print(f"Loading {split_name} data from {split_path}...")
-    #     with open(split_path, 'rb') as f:
-    #         split_data[split_name] = pickle.load(f)
+    # --- 2. Load Data ---
+    split_paths = [
+        # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
+        ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+    ]
+    split_data = {}
+    for split_name, split_path in split_paths:
+        if rank == 0:
+            print(f"Loading {split_name} data from {split_path}...")
+        with open(split_path, 'rb') as f:
+            split_data[split_name] = pickle.load(f)
 
-    # combined_data = {}
-    # symbols = set()
-    # for data_dict in split_data.values():
-    #     symbols.update(data_dict.keys())
-    # symbols = sorted(symbols)
+    combined_data = {}
+    symbols = set()
+    for data_dict in split_data.values():
+        symbols.update(data_dict.keys())
+    symbols = sorted(symbols)
 
-    # for symbol in symbols:
-    #     frames = []
-    #     for split_name, _ in split_paths:
-    #         df = split_data.get(split_name, {}).get(symbol)
-    #         if df is not None and not df.empty:
-    #             frames.append(df)
-    #     if frames:
-    #         # Keep validation rows ahead of test rows so the series stays continuous.
-    #         combined_data[symbol] = pd.concat(frames)
-    # if rank == 0 and len(split_paths) > 1:
-    #     print("Data merged")
+    for symbol in symbols:
+        frames = []
+        for split_name, _ in split_paths:
+            df = split_data.get(split_name, {}).get(symbol)
+            if df is not None and not df.empty:
+                frames.append(df)
+        if frames:
+            # Keep validation rows ahead of test rows so the series stays continuous.
+            combined_data[symbol] = pd.concat(frames)
+    if rank == 0 and len(split_paths) > 1:
+        print("Data merged")
 
-    # test_data = combined_data
-    # # if rank == 0:
-    # #     print(test_data)
+    test_data = combined_data
+    # if rank == 0:
+    #     print(test_data)
 
-    # # --- 3. Generate Predictions ---
-    # model_preds = generate_predictions(run_config, test_data, device, rank, world_size)
+    # --- 3. Generate Predictions ---
+    model_preds = generate_predictions(run_config, test_data, device, rank, world_size)
 
-    # if ddp_enabled and dist.is_initialized():
-    #     dist.barrier()
+    if ddp_enabled and dist.is_initialized():
+        dist.barrier()
         
     if rank != 0:
         return
 
-    # # --- 4. Save Predictions ---
-    # if rank == 0 and model_preds:
-    #     save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     predictions_file = os.path.join(save_dir, "predictions.pkl")
-    #     print(f"Saving prediction signals to {predictions_file}...")
-    #     with open(predictions_file, 'wb') as f:
-    #         pickle.dump(model_preds, f)
+    # --- 4. Save Predictions ---
+    if rank == 0 and model_preds:
+        save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
+        os.makedirs(save_dir, exist_ok=True)
+        predictions_file = os.path.join(save_dir, "predictions.pkl")
+        print(f"Saving prediction signals to {predictions_file}...")
+        with open(predictions_file, 'wb') as f:
+            pickle.dump(model_preds, f)
 
     # --- 5. Run Backtesting ---
     save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])

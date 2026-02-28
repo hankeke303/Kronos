@@ -20,6 +20,9 @@ def parse_args():
     parser.add_argument('--chip',        default=5,     type=int)
     parser.add_argument('--inter',      default='3',     choices=['2','3','5','10','15'])
     parser.add_argument('--thres_step',      default=0.2, type=float)
+    parser.add_argument('--backtest_pred', default='close', choices=['close', 'close_return'])
+    parser.add_argument('--buythreshold', default=None, type=float)
+    parser.add_argument('--sellthreshold', default=None, type=float)
     args = parser.parse_args()
     
     return args
@@ -31,7 +34,10 @@ def compose_reward(
     all_data_file: str = 'dtprice_stdict.npy',
     all_signals_file: str = 'mapsignals.npy',
     stock_real_dict_file: str = 'dtstockdict.npy',
-    stock_hy_all_dict_file: str = 'stockhyalldict.npy'
+    stock_hy_all_dict_file: str = 'stockhyalldict.npy',
+    backtest_pred: str = 'close',
+    buythreshold: float | None = None,
+    sellthreshold: float | None = None,
 ):
     dfs = pd.DataFrame(columns=[
         'modelname', 'buythreshold', 'sellthreshold',
@@ -51,7 +57,11 @@ def compose_reward(
     # indexss = [6, 7, 8,9,15,17,19]
     # alldata = np.delete(alldata, indexss,axis=3)
     nowdate = np.array(sorted(list(allsignals.keys())))
-    buythreshold = 0.5
+    if backtest_pred not in {'close', 'close_return'}:
+        raise ValueError(f"Unsupported backtest_pred: {backtest_pred}")
+
+    buythreshold = 0.5 if buythreshold is None else buythreshold
+    sellthrehsold_default = -10 if sellthreshold is None else sellthreshold
     for ups in range(20):
         # chip = args.chip
         stockdict = np.sort(np.load(stock_hy_all_dict_file, allow_pickle=True))
@@ -61,7 +71,7 @@ def compose_reward(
         buythreshold = buythreshold + thres_step
         allmoney = 10000000
         exchange_fee = 0.0015
-        sellthrehsold = -10  # 最好参数 1.3 0.3 -0.05  126w
+        sellthrehsold = sellthrehsold_default  # 最好参数 1.3 0.3 -0.05  126w
         buypoint = 0
         sellpoint = 0
         allbuyacc = 0
@@ -93,6 +103,8 @@ def compose_reward(
             stocks_today = stock_real_dict[date]  # 当日 N 个股票名
             today_signals = allsignals[date]
             result = today_signals
+            if backtest_pred == 'close_return':
+                result = result * 100
 
             nowtime_index = np.where(nowdate == date)[0]
             alldownbuy = []

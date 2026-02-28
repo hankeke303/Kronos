@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_20260105_new-12-features"
+        self.run_id = "test_202602021340_new-12-features-14bit_new-predictor-only_ccc_decay0.2_lr1e-5_6layer"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"
@@ -91,7 +91,7 @@ class Config:
 
         self.epochs = 250
         self.log_interval = 100  # Log training status every N batches.
-        self.batch_size = 400  # Batch size per GPU.
+        self.batch_size = 300  # Batch size per GPU.
 
         # Early stopping patience: stop if val loss does not improve for N epochs.
         self.early_stop_patience = 999999
@@ -103,7 +103,7 @@ class Config:
 
         # Learning rates for different model components.
         self.tokenizer_learning_rate = 1e-5
-        self.predictor_learning_rate = 4e-5
+        self.predictor_learning_rate = 1e-5
 
         # Gradient accumulation to simulate a larger batch size.
         self.accumulation_steps = 1
@@ -111,7 +111,7 @@ class Config:
         # AdamW optimizer parameters.
         self.adam_beta1 = 0.9
         self.adam_beta2 = 0.95
-        self.adam_weight_decay = 0.1
+        self.adam_weight_decay = 0.2
 
         # Miscellaneous
         self.seed = 100  # Global random seed for reproducibility.
@@ -148,8 +148,8 @@ class Config:
             "n_enc_layers": 5,
             "n_heads": 8,
             "resid_dropout_p": 0.0,
-            "s1_bits": 10,
-            "s2_bits": 10,
+            "s1_bits": 14,
+            "s2_bits": 14,
             "zeta": 0.05
         }
         # self.predictor_model_initialize_params = {
@@ -172,10 +172,10 @@ class Config:
             "ffn_dropout_p": 0.25,
             "learn_te": True,
             "n_heads": 8,
-            "n_layers": 8,
+            "n_layers": 6,
             "resid_dropout_p": 0.25,
-            "s1_bits": 10,
-            "s2_bits": 10,
+            "s1_bits": 14,
+            "s2_bits": 14,
             "token_dropout_p": 0.1
         }
 
@@ -214,9 +214,9 @@ class Config:
 
         # Paths to the fine-tuned models, derived from the save_path.
         # These will be generated automatically during training.
-        self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
+        # self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
         # self.finetuned_tokenizer_path = "NeoQuasar/Kronos-Tokenizer-base"
-        # self.finetuned_tokenizer_path = "outputs/models/finetune_tokenizer_demo_test_202512270306_tokenizer_23_lr5e-6_decay0.3_batch200/checkpoints/best_model"
+        self.finetuned_tokenizer_path = "./outputs/models/finetune_tokenizer_demo_test_202601072120_new-12-features-14bit/checkpoints/best_model"
         self.finetuned_predictor_path = f"{self.save_path}/{self.predictor_save_folder_name}/checkpoints/best_model"
         # self.finetuned_predictor_path = "NeoQuasar/Kronos-base"
         # self.finetuned_predictor_path = "./outputs/models/finetune_predictor_demo_test_202512142358_predictor_12feature_14bit-5_tokloss0.0056/checkpoints/best_model"
@@ -235,10 +235,13 @@ class Config:
         self.inference_sample_count = 5
         self.backtest_batch_size = 1000
         self.backtest_benchmark = self._set_benchmark(self.instrument)
+        
         # =================================================================
         # New added by ZMJ
         # =================================================================
         self.backtest_pred = 'close_return'    # supported: 'close' or 'close_return' now, 20260112
+        if self.backtest_pred == 'close_return':
+            self.backtest_save_folder_name += '_closereturn'
 
     def _set_benchmark(self, instrument):
         dt_benchmark = {

@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_202601102318_new-12-features-20bit"
+        self.run_id = "test_202602061753_new-12-features-16bit-3"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"
@@ -31,7 +31,7 @@ class Config:
         # Sliding window parameters for creating samples.
         self.lookback_window = 90  # Number of past time steps for input.
         self.predict_window = 10  # Number of future time steps for prediction.
-        self.max_context = 512  # Maximum context length for the model.
+        self.max_context = 512  # M aximum context length for the model.
 
         # Features to be used from the raw data.
         # self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
@@ -148,8 +148,8 @@ class Config:
             "n_enc_layers": 5,
             "n_heads": 8,
             "resid_dropout_p": 0.0,
-            "s1_bits": 20,
-            "s2_bits": 20,
+            "s1_bits": 16,
+            "s2_bits": 16,
             "zeta": 0.05
         }
         # self.predictor_model_initialize_params = {
@@ -174,8 +174,8 @@ class Config:
             "n_heads": 8,
             "n_layers": 8,
             "resid_dropout_p": 0.25,
-            "s1_bits": 20,
-            "s2_bits": 20,
+            "s1_bits": 16,
+            "s2_bits": 16,
             "token_dropout_p": 0.1
         }
 
@@ -214,9 +214,9 @@ class Config:
 
         # Paths to the fine-tuned models, derived from the save_path.
         # These will be generated automatically during training.
-        # self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
+        self.finetuned_tokenizer_path = f"{self.save_path}/{self.tokenizer_save_folder_name}/checkpoints/best_model"
         # self.finetuned_tokenizer_path = "NeoQuasar/Kronos-Tokenizer-base"
-        self.finetuned_tokenizer_path = "outputs/models/finetune_tokenizer_demo_test_202512270306_tokenizer_23_lr5e-6_decay0.3_batch200/checkpoints/best_model"
+        # self.finetuned_tokenizer_path = "outputs/models/finetune_tokenizer_demo_test_202512270306_tokenizer_23_lr5e-6_decay0.3_batch200/checkpoints/best_model"
         self.finetuned_predictor_path = f"{self.save_path}/{self.predictor_save_folder_name}/checkpoints/best_model"
         # self.finetuned_predictor_path = "NeoQuasar/Kronos-base"
         # self.finetuned_predictor_path = "./outputs/models/finetune_predictor_demo_test_202512142358_predictor_12feature_14bit-5_tokloss0.0056/checkpoints/best_model"
@@ -235,6 +235,12 @@ class Config:
         self.inference_sample_count = 5
         self.backtest_batch_size = 1000
         self.backtest_benchmark = self._set_benchmark(self.instrument)
+        # =================================================================
+        # New added by ZMJ
+        # =================================================================
+        self.backtest_pred = 'close_return'    # supported: 'close' or 'close_return' now, 20260112
+        if self.backtest_pred == 'close_return':
+            self.backtest_save_folder_name += '_closereturn'
 
     def _set_benchmark(self, instrument):
         dt_benchmark = {

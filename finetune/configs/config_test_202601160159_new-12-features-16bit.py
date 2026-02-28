@@ -22,7 +22,7 @@ class Config:
         # self.run_id = "test_20251126_0034_train_predictor_with_new_tokenizer"
         # self.run_id = "test_20251126_0918_train_predictor_with_new_tokenizer_scratch"
         # self.run_id = "test_202512011451_predictor_w_tokenizer11301359_l0072-2"
-        self.run_id = "test_20260105_new-12-features"
+        self.run_id = "test_202601160159_new-12-features-16bit"
 
         # Overall time range for data loading from Qlib.
         self.dataset_begin_time = "2005-01-04"
@@ -148,8 +148,8 @@ class Config:
             "n_enc_layers": 5,
             "n_heads": 8,
             "resid_dropout_p": 0.0,
-            "s1_bits": 10,
-            "s2_bits": 10,
+            "s1_bits": 16,
+            "s2_bits": 16,
             "zeta": 0.05
         }
         # self.predictor_model_initialize_params = {
@@ -174,8 +174,8 @@ class Config:
             "n_heads": 8,
             "n_layers": 8,
             "resid_dropout_p": 0.25,
-            "s1_bits": 10,
-            "s2_bits": 10,
+            "s1_bits": 16,
+            "s2_bits": 16,
             "token_dropout_p": 0.1
         }
 
@@ -239,6 +239,8 @@ class Config:
         # New added by ZMJ
         # =================================================================
         self.backtest_pred = 'close_return'    # supported: 'close' or 'close_return' now, 20260112
+        if self.backtest_pred == 'close_return':
+            self.backtest_save_folder_name += '_closereturn'
 
     def _set_benchmark(self, instrument):
         dt_benchmark = {

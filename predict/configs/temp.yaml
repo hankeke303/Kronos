@@ -1,0 +1,108 @@
+# 模型路径配置
+model:
+  # Tokenizer checkpoint 路径（本地路径或 HuggingFace Hub 标识）
+  tokenizer_path: "./Kronos-models/20260221/Tokenizer"
+  # Predictor checkpoint 路径（本地路径或 HuggingFace Hub 标识）
+  predictor_path: "./Kronos-models/20260221/Predictor/checkpoints/best_model"
+
+# 输入数据配置（单个 CSV）
+input:
+  # 输入 CSV 文件路径
+  csv_path: "../dataForPKU-2/stock/000001.csv"
+  # 时间列名，脚本会将该列解析为 datetime
+  time_col: "date"
+  # 时间戳模式：
+  # - auto_extrapolate: 根据历史时间步长自动外推未来 pred_len 个时间戳
+  # - future_window: 使用“真实未来窗口”时间戳
+  timestamp_mode: "auto_extrapolate"
+  # 当 timestamp_mode=future_window 时可选：单独提供未来时间 CSV（只需要时间列）
+  # 为空时，脚本会从同一个输入 CSV 的末尾窗口中切分出未来时间（要求至少 lookback+pred_len 行）
+  future_time_csv_path: ""
+  # future_time_csv_path 使用的时间列名；为空时默认与 time_col 相同
+  future_time_col: ""
+  # 特征模板名称；若 feature_cols 非空，则优先使用 feature_cols。模版可以通过下面的 feature_templates 配置
+  feature_template: "template_12"
+  # 显式指定特征列顺序；为空时使用 feature_template 对应模板
+  # 注意：特征数量与顺序必须与 tokenizer 的 d_in/训练时一致
+  feature_cols: []
+  # 历史窗口长度（从 CSV 尾部截取最近 lookback_window 行作为上下文）
+  lookback_window: 90
+  # 是否按时间升序排序（建议 true）
+  sort_ascending: true
+  # 缺失值处理策略：error | drop | ffill
+  nan_policy: "error"
+  # 当无法可靠推断频率时使用的兜底频率（如 1D、5min、1H）
+  fallback_freq: "5min"
+  # 是否在推理前自动计算 return 特征（open_return/close_return/hy_*_return）
+  # 开启时需要 CSV 中包含 open/close/hy_open/hy_close
+  compute_extra_features: true
+
+# 推理采样参数
+inference:
+  # 预测未来步数
+  pred_len: 10
+  # 模型最大上下文长度（需与模型结构/训练配置匹配）
+  max_context: 512
+  # 归一化后截断阈值
+  clip: 5.0
+  # 采样温度（越大越随机）
+  T: 0.6
+  # nucleus sampling 的 top-p
+  top_p: 0.9
+  # top-k sampling 的 top-k（0 表示关闭）
+  top_k: 0
+  # 每个样本采样次数，内部会对多次采样结果求均值
+  sample_count: 5
+  # 设备：auto | cpu | cuda:0 等
+  device: "auto"
+  # 是否显示自回归推理进度
+  verbose: false
+
+# 输出配置
+output:
+  # 输出目录
+  save_dir: "./outputs/predictions"
+  # 输出文件名前缀
+  prefix: "infer"
+  # CSV 浮点数保留位数
+  float_precision: 8
+
+# 信号计算配置（对齐 qlib_test.py 的 close/close_return 语义）
+signal:
+  # 是否计算信号
+  enabled: true
+  # 信号类型：close | close_return
+  # close: 使用未来 close 与历史最后一个 close 的差
+  # close_return: 对未来 close_return 做累加后再计算 last/mean/max/min
+  backtest_pred: "close_return"
+  # 当 backtest_pred=close 时使用的列名
+  close_col: "close"
+  # 当 backtest_pred=close_return 时使用的列名
+  close_return_col: "close_return"
+  # 是否额外保存逐步 signal 序列 CSV
+  save_series: true
+
+# 可复用特征模板（你可以新增 template_xxx）
+feature_templates:
+  # 6 特征模板
+  template_6:
+    - open
+    - high
+    - low
+    - close
+    - vol
+    - amt
+  # 12 特征模板（对齐 finetune/config.py 当前 feature_list）
+  template_12:
+    - open
+    - high
+    - low
+    - close
+    - volume_post
+    - amount
+    - flag
+    - circulating_market_cap
+    - open_return
+    - close_return
+    - hy_open_return
+    - hy_close_return

@@ -7,6 +7,7 @@ import argparse
 import csv
 import torch.distributed as dist
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -26,6 +27,48 @@ from utils.training_utils import (
     get_model_size,
     format_time
 )
+
+
+# revised by ZMJ. 2026-1-17
+def compute_ccc_loss(pred, target):
+    """
+    Compute Concordance Correlation Coefficient (CCC) loss.
+    Only computed on close_return column (index 9).
+    
+    Args:
+        pred (torch.Tensor): Predicted values, shape [batch_size, seq_len, d_in]
+        target (torch.Tensor): Target values, shape [batch_size, seq_len, d_in]
+    
+    Returns:
+        torch.Tensor: CCC loss (1 - CCC), scalar
+    """
+    # revised by ZMJ. 2026-1-17: Only compute CCC on close_return column (index 9)
+    feature_idx = 9  # close_return column index
+    pred_feature = pred[:, :, feature_idx].reshape(-1)  # [N]
+    target_feature = target[:, :, feature_idx].reshape(-1)  # [N]
+    
+    # Compute means and standard deviations
+    pred_mean = pred_feature.mean()
+    target_mean = target_feature.mean()
+    pred_std = pred_feature.std()
+    target_std = target_feature.std()
+    
+    # Compute Pearson correlation coefficient
+    pred_centered = pred_feature - pred_mean  # [N]
+    target_centered = target_feature - target_mean  # [N]
+    numerator = (pred_centered * target_centered).mean()
+    denominator = pred_std * target_std + 1e-8
+    rho = numerator / denominator
+    
+    # Compute CCC
+    ccc_numerator = 2 * rho * pred_std * target_std
+    ccc_denominator = pred_std ** 2 + target_std ** 2 + (pred_mean - target_mean) ** 2 + 1e-8
+    ccc = ccc_numerator / ccc_denominator
+    
+    # Convert to loss (1 - CCC)
+    ccc_loss = 1.0 - ccc
+    
+    return ccc_loss
 
 
 def create_dataloaders(config: dict, rank: int, world_size: int):
@@ -109,6 +152,9 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         
         num_iters = len(train_loader)
         epoch_train_loss_sum = 0.0
+        epoch_ce_loss_sum = 0.0
+        epoch_ccc_loss_sum = 0.0
+        epoch_combine_loss_sum = 0.0
 
         for i, (batch_x, batch_x_stamp) in enumerate(train_loader):
             batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
@@ -124,28 +170,88 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
             # Forward pass and loss calculation
             logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-            loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+            ce_loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+
+            # revised by ZMJ. 2026-1-17
+            # Get top-10 predicted tokens from logits using Straight-Through Estimator (STE)
+            # Forward: use topk indices (not differentiable), Backward: gradient flows through softmax probabilities
+            s1_logits, s2_logits = logits[0], logits[1]  # [batch_size, seq_len, vocab_size]
+            batch_size, seq_len = s1_logits.shape[0], s1_logits.shape[1]
+            
+            # Use softmax to get probabilities (differentiable)
+            top_k = 10
+            s1_probs = F.softmax(s1_logits, dim=-1)  # [batch_size, seq_len, vocab_size]
+            s2_probs = F.softmax(s2_logits, dim=-1)  # [batch_size, seq_len, vocab_size]
+            
+            # Get top-k indices and their probabilities
+            s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)  # [batch_size, seq_len, top_k]
+            s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)  # [batch_size, seq_len, top_k]
+            
+            # Normalize probabilities to sum to 1 for each position (differentiable)
+            s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+            s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            # Decode each top-k token pair
+            # Note: topk indices are not differentiable, but we use STE:
+            # Forward: use indices for decode, Backward: gradient flows through probabilities
+            pred_values_list = []
+            for k_idx in range(min(top_k, s1_logits.shape[-1])):
+                # Use indices for forward pass (not differentiable, but that's OK)
+                s1_tokens_k = s1_topk_indices[:, :, k_idx]  # [batch_size, seq_len]
+                s2_tokens_k = s2_topk_indices[:, :, k_idx]  # [batch_size, seq_len]
+                decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)  # [batch_size, seq_len, d_in]
+                pred_values_list.append(decoded_k)
+            
+            # Stack decoded values
+            pred_values_stack = torch.stack(pred_values_list, dim=0)  # [top_k, batch_size, seq_len, d_in]
+            
+            # Use softmax probabilities as weights (differentiable - gradient flows through this to logits)
+            # Create weight matrix: [top_k, batch_size, seq_len]
+            weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)  # [top_k, batch_size, seq_len]
+            weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)  # Normalize
+            weights_stack = weights_stack.unsqueeze(-1)  # [top_k, batch_size, seq_len, 1]
+            
+            # Weighted sum: gradient flows through weights (probabilities) back to logits
+            # Even though decoded values come from non-differentiable indices,
+            # the gradient flows through the differentiable weights (probabilities)
+            pred_values = (pred_values_stack * weights_stack).sum(dim=0)  # [batch_size, seq_len, d_in]
+            
+            # Get true values corresponding to token_out positions (batch_x[:, 1:])
+            true_values = batch_x[:, 1:, :]  # [batch_size, seq_len, d_in]
+            
+            # Compute CCC loss
+            ccc_loss = compute_ccc_loss(pred_values, true_values)
+            
+            # Combine original loss and CCC loss (average)
+            combine_loss = ccc_loss
 
             # Backward pass and optimization
             optimizer.zero_grad()
-            loss.backward()
+            combine_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             optimizer.step()
             # scheduler.step()
             scheduler.step(epoch_idx + i / num_iters)
 
             # Logging (Master Process Only)
-            batch_loss_value = loss.item()
+            batch_ce_loss_value = ce_loss.item()
+            batch_ccc_loss_value = ccc_loss.item()
+            batch_loss_value = combine_loss.item()
             epoch_train_loss_sum += batch_loss_value
+            epoch_ce_loss_sum += batch_ce_loss_value
+            epoch_ccc_loss_sum += batch_ccc_loss_value
+            epoch_combine_loss_sum += batch_loss_value
             if rank == 0 and (batch_idx_global + 1) % config['log_interval'] == 0:
                 lr = optimizer.param_groups[0]['lr']
                 print(
                     f"[Rank {rank}, Epoch {epoch_idx + 1}/{config['epochs']}, Step {i + 1}/{len(train_loader)}] "
-                    f"LR {lr:.6f}, Loss: {batch_loss_value:.4f}"
+                    f"LR {lr:.6f}, Combine Loss: {batch_loss_value:.4f}, CE Loss: {batch_ce_loss_value:.4f}, CCC Loss: {batch_ccc_loss_value:.4f}"
                 )
             if rank == 0 and logger:
                 lr = optimizer.param_groups[0]['lr']
-                logger.log_metric('train_predictor_loss_batch', batch_loss_value, step=batch_idx_global)
+                logger.log_metric('train_ce_loss_batch', batch_ce_loss_value, step=batch_idx_global)
+                logger.log_metric('train_ccc_loss_batch', batch_ccc_loss_value, step=batch_idx_global)
+                logger.log_metric('train_combine_loss_batch', batch_loss_value, step=batch_idx_global)
                 logger.log_metric('train_S1_loss_each_batch', s1_loss.item(), step=batch_idx_global)
                 logger.log_metric('train_S2_loss_each_batch', s2_loss.item(), step=batch_idx_global)
                 logger.log_metric('predictor_learning_rate', lr, step=batch_idx_global)
@@ -154,7 +260,9 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
 
         # --- Validation Loop ---
         model.eval()
-        tot_val_loss_sum_rank = 0.0
+        tot_val_ce_loss_rank = 0.0
+        tot_val_ccc_loss_rank = 0.0
+        tot_val_combine_loss_rank = 0.0
         val_batches_processed_rank = 0
         with torch.no_grad():
             for batch_x, batch_x_stamp in val_loader:
@@ -166,21 +274,55 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                ce_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
-                tot_val_loss_sum_rank += val_loss.item()
+                # Compute CCC loss for validation
+                with torch.no_grad():
+                    top_k = 10
+                    s1_logits, s2_logits = logits[0], logits[1]
+                    s1_probs = F.softmax(s1_logits, dim=-1)
+                    s2_probs = F.softmax(s2_logits, dim=-1)
+                    s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)
+                    s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)
+                    s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                    s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                    
+                    pred_values_list = []
+                    for k_idx in range(min(top_k, s1_logits.shape[-1])):
+                        s1_tokens_k = s1_topk_indices[:, :, k_idx]
+                        s2_tokens_k = s2_topk_indices[:, :, k_idx]
+                        decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)
+                        pred_values_list.append(decoded_k)
+                    
+                    pred_values_stack = torch.stack(pred_values_list, dim=0)
+                    weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)
+                    weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)
+                    weights_stack = weights_stack.unsqueeze(-1)
+                    pred_values = (pred_values_stack * weights_stack).sum(dim=0)
+                    true_values = batch_x[:, 1:, :]
+                    ccc_loss = compute_ccc_loss(pred_values, true_values)
+                    combine_loss = ccc_loss
+
+                tot_val_ce_loss_rank += ce_loss.item()
+                tot_val_ccc_loss_rank += ccc_loss.item()
+                tot_val_combine_loss_rank += combine_loss.item()
                 val_batches_processed_rank += 1
 
         # Reduce validation metrics
-        val_loss_sum_tensor = torch.tensor(tot_val_loss_sum_rank, device=device)
+        val_loss_sum_tensor = torch.tensor([tot_val_ce_loss_rank, tot_val_ccc_loss_rank, tot_val_combine_loss_rank], device=device)
         val_batches_tensor = torch.tensor(val_batches_processed_rank, device=device)
         dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_batches_tensor, op=dist.ReduceOp.SUM)
 
-        avg_val_loss = val_loss_sum_tensor.item() / val_batches_tensor.item() if val_batches_tensor.item() > 0 else 0
+        avg_val_ce_loss = val_loss_sum_tensor[0].item() / val_batches_tensor.item() if val_batches_tensor.item() > 0 else 0
+        avg_val_ccc_loss = val_loss_sum_tensor[1].item() / val_batches_tensor.item() if val_batches_tensor.item() > 0 else 0
+        avg_val_combine_loss = val_loss_sum_tensor[2].item() / val_batches_tensor.item() if val_batches_tensor.item() > 0 else 0
+        avg_val_loss = avg_val_combine_loss  # For backward compatibility
 
         # --- Test Loop (no console output) ---
-        tot_test_loss_sum_rank = 0.0
+        tot_test_ce_loss_rank = 0.0
+        tot_test_ccc_loss_rank = 0.0
+        tot_test_combine_loss_rank = 0.0
         test_batches_processed_rank = 0
         with torch.no_grad():
             for batch_x, batch_x_stamp in test_loader:
@@ -192,40 +334,85 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
 
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                test_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                ce_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
-                tot_test_loss_sum_rank += test_loss.item()
+                # Compute CCC loss for test
+                with torch.no_grad():
+                    top_k = 10
+                    s1_logits, s2_logits = logits[0], logits[1]
+                    s1_probs = F.softmax(s1_logits, dim=-1)
+                    s2_probs = F.softmax(s2_logits, dim=-1)
+                    s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)
+                    s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)
+                    s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                    s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                    
+                    pred_values_list = []
+                    for k_idx in range(min(top_k, s1_logits.shape[-1])):
+                        s1_tokens_k = s1_topk_indices[:, :, k_idx]
+                        s2_tokens_k = s2_topk_indices[:, :, k_idx]
+                        decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)
+                        pred_values_list.append(decoded_k)
+                    
+                    pred_values_stack = torch.stack(pred_values_list, dim=0)
+                    weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)
+                    weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)
+                    weights_stack = weights_stack.unsqueeze(-1)
+                    pred_values = (pred_values_stack * weights_stack).sum(dim=0)
+                    true_values = batch_x[:, 1:, :]
+                    ccc_loss = compute_ccc_loss(pred_values, true_values)
+                    combine_loss = ccc_loss
+
+                tot_test_ce_loss_rank += ce_loss.item()
+                tot_test_ccc_loss_rank += ccc_loss.item()
+                tot_test_combine_loss_rank += combine_loss.item()
                 test_batches_processed_rank += 1
 
-        test_loss_sum_tensor = torch.tensor(tot_test_loss_sum_rank, device=device)
+        test_loss_sum_tensor = torch.tensor([tot_test_ce_loss_rank, tot_test_ccc_loss_rank, tot_test_combine_loss_rank], device=device)
         test_batches_tensor = torch.tensor(test_batches_processed_rank, device=device)
         dist.all_reduce(test_loss_sum_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(test_batches_tensor, op=dist.ReduceOp.SUM)
-        avg_test_loss = test_loss_sum_tensor.item() / test_batches_tensor.item() if test_batches_tensor.item() > 0 else 0
+        avg_test_ce_loss = test_loss_sum_tensor[0].item() / test_batches_tensor.item() if test_batches_tensor.item() > 0 else 0
+        avg_test_ccc_loss = test_loss_sum_tensor[1].item() / test_batches_tensor.item() if test_batches_tensor.item() > 0 else 0
+        avg_test_combine_loss = test_loss_sum_tensor[2].item() / test_batches_tensor.item() if test_batches_tensor.item() > 0 else 0
+        avg_test_loss = avg_test_combine_loss  # For backward compatibility
 
         # --- Aggregate train loss across ranks ---
-        train_loss_sum_tensor = torch.tensor(epoch_train_loss_sum, device=device)
+        train_loss_sum_tensor = torch.tensor([epoch_ce_loss_sum, epoch_ccc_loss_sum, epoch_combine_loss_sum], device=device)
         dist.all_reduce(train_loss_sum_tensor, op=dist.ReduceOp.SUM)
-        avg_train_loss = train_loss_sum_tensor.item() / (num_iters * world_size) if num_iters > 0 else 0
+        avg_ce_loss = train_loss_sum_tensor[0].item() / (num_iters * world_size) if num_iters > 0 else 0
+        avg_ccc_loss = train_loss_sum_tensor[1].item() / (num_iters * world_size) if num_iters > 0 else 0
+        avg_combine_loss = train_loss_sum_tensor[2].item() / (num_iters * world_size) if num_iters > 0 else 0
+        avg_train_loss = avg_combine_loss  # For backward compatibility
 
         current_lr = optimizer.param_groups[0]['lr']
 
         # --- End of Epoch Summary & Checkpointing (Master Process Only) ---
         if rank == 0:
             print(f"\n--- Epoch {epoch_idx + 1}/{config['epochs']} Summary ---")
-            print(f"Train Loss: {avg_train_loss:.4f}")
-            print(f"Validation Loss: {avg_val_loss:.4f}")
+            print(f"Train - CE Loss: {avg_ce_loss:.4f}, CCC Loss: {avg_ccc_loss:.4f}, Combine Loss: {avg_combine_loss:.4f}")
+            print(f"Validation - CE Loss: {avg_val_ce_loss:.4f}, CCC Loss: {avg_val_ccc_loss:.4f}, Combine Loss: {avg_val_combine_loss:.4f}")
+            print(f"Test - CE Loss: {avg_test_ce_loss:.4f}, CCC Loss: {avg_test_ccc_loss:.4f}, Combine Loss: {avg_test_combine_loss:.4f}")
             print(f"Time This Epoch: {format_time(time.time() - epoch_start_time)}")
             print(f"Total Time Elapsed: {format_time(time.time() - start_time)}\n")
 
             if logger:
-                logger.log_metric('train_predictor_loss_epoch', avg_train_loss, epoch=epoch_idx)
-                logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
-                logger.log_metric('test_predictor_loss_epoch', avg_test_loss, epoch=epoch_idx)
+                # Train metrics
+                logger.log_metric('train_ce_loss_epoch', avg_ce_loss, epoch=epoch_idx)
+                logger.log_metric('train_ccc_loss_epoch', avg_ccc_loss, epoch=epoch_idx)
+                logger.log_metric('train_combine_loss_epoch', avg_combine_loss, epoch=epoch_idx)
+                # Validation metrics
+                logger.log_metric('val_ce_loss_epoch', avg_val_ce_loss, epoch=epoch_idx)
+                logger.log_metric('val_ccc_loss_epoch', avg_val_ccc_loss, epoch=epoch_idx)
+                logger.log_metric('val_combine_loss_epoch', avg_val_combine_loss, epoch=epoch_idx)
+                # Test metrics
+                logger.log_metric('test_ce_loss_epoch', avg_test_ce_loss, epoch=epoch_idx)
+                logger.log_metric('test_ccc_loss_epoch', avg_test_ccc_loss, epoch=epoch_idx)
+                logger.log_metric('test_combine_loss_epoch', avg_test_combine_loss, epoch=epoch_idx)
                 # logger.log_metric('predictor_learning_rate_epoch', current_lr, epoch=epoch_idx)
 
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            if avg_val_combine_loss < best_val_loss:
+                best_val_loss = avg_val_combine_loss
                 best_epoch = epoch_idx + 1
                 patience_counter = 0
                 save_path = f"{save_dir}/checkpoints/best_model"
@@ -236,13 +423,13 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 patience_counter += 1
 
             # Save metrics to CSV after each epoch (append mode)
-            header = ['epoch', 'learning_rate', 'train_loss', 'val_loss', 'test_loss']
+            header = ['epoch', 'learning_rate', 'train_ce_loss', 'train_ccc_loss', 'train_combine_loss', 'val_ce_loss', 'val_ccc_loss', 'val_combine_loss', 'test_ce_loss', 'test_ccc_loss', 'test_combine_loss']
             file_exists = os.path.exists(metrics_csv_path)
             with open(metrics_csv_path, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 if not file_exists:
                     writer.writerow(header)
-                writer.writerow([epoch_idx + 1, current_lr, avg_train_loss, avg_val_loss, avg_test_loss])
+                writer.writerow([epoch_idx + 1, current_lr, avg_ce_loss, avg_ccc_loss, avg_combine_loss, avg_val_ce_loss, avg_val_ccc_loss, avg_val_combine_loss, avg_test_ce_loss, avg_test_ccc_loss, avg_test_combine_loss])
 
             stop_tensor = torch.tensor(int(patience_counter >= patience_limit), device=device)
         else:
