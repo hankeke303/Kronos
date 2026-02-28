@@ -1,3 +1,12 @@
+"""
+推理脚本（统一推理流程）。
+
+目标：
+1) 从 YAML 读取模型路径、输入特征与推理参数。
+2) 基于历史窗口执行 Kronos 自回归推理。
+3) 输出预测结果、元信息，以及可选的 signal 统计。
+"""
+
 import argparse
 import json
 import os
@@ -46,10 +55,12 @@ FEATURE_TEMPLATES = {
 }
 
 DEFAULT_CONFIG = {
+    # 模型 checkpoint 配置
     "model": {
         "tokenizer_path": "",
         "predictor_path": "",
     },
+    # 输入数据配置
     "input": {
         "csv_path": "",
         "time_col": "timestamps",
@@ -64,6 +75,7 @@ DEFAULT_CONFIG = {
         "fallback_freq": "1D",
         "compute_extra_features": False,
     },
+    # 推理参数
     "inference": {
         "pred_len": 10,
         "max_context": 512,
@@ -75,11 +87,13 @@ DEFAULT_CONFIG = {
         "device": "auto",
         "verbose": False,
     },
+    # 输出配置
     "output": {
         "save_dir": "./outputs/predictions",
         "prefix": "infer",
         "float_precision": 8,
     },
+    # 可选 signal 配置（用于对齐回测信号语义）
     "signal": {
         "enabled": False,
         "backtest_pred": "close_return",
@@ -91,6 +105,10 @@ DEFAULT_CONFIG = {
 
 
 def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    """递归更新字典。
+
+    作用：将用户 YAML 覆盖到默认配置上，保持未填写项仍有默认值。
+    """
     result = deepcopy(base)
     for key, value in updates.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
@@ -101,6 +119,7 @@ def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
+    """加载 YAML 配置并与默认配置合并。"""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -110,6 +129,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 
 def resolve_feature_cols(input_cfg: Dict[str, Any], templates: Dict[str, List[str]]) -> List[str]:
+    """解析最终使用的特征列顺序。
+
+    优先级：
+    1) input.feature_cols（显式）
+    2) input.feature_template（模板）
+    """
     feature_cols = input_cfg.get("feature_cols") or []
     if feature_cols:
         return feature_cols
@@ -123,6 +148,11 @@ def resolve_feature_cols(input_cfg: Dict[str, Any], templates: Dict[str, List[st
 
 
 def resolve_device(device_str: str) -> torch.device:
+    """解析运行设备。
+
+    - auto: 有 CUDA 用 cuda:0，否则 cpu
+    - 显式 cuda 在不可用时会报错，避免静默降级
+    """
     if device_str == "auto":
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
@@ -132,6 +162,10 @@ def resolve_device(device_str: str) -> torch.device:
 
 
 def infer_frequency_delta(timestamps: pd.Series, fallback_freq: str) -> pd.Timedelta:
+    """根据历史时间戳推断采样间隔。
+
+    使用正向时间差的中位数作为频率；推断失败时回退到 fallback_freq。
+    """
     if len(timestamps) < 2:
         return pd.to_timedelta(fallback_freq)
 
@@ -151,12 +185,21 @@ def build_future_timestamps(
     pred_len: int,
     fallback_freq: str,
 ) -> pd.DatetimeIndex:
+    """按推断频率生成未来 pred_len 个时间戳。"""
     last_ts = timestamps.iloc[-1]
     delta = infer_frequency_delta(timestamps, fallback_freq)
     return pd.date_range(start=last_ts + delta, periods=pred_len, freq=delta)
 
 
 def resolve_context_and_timestamps(cfg: Dict[str, Any], df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex, str]:
+    """根据 timestamp_mode 组装上下文窗口与未来时间戳。
+
+    返回：
+    - context_df: 历史上下文数据（用于模型输入）
+    - x_timestamp: 历史时间戳
+    - y_timestamp: 未来时间戳
+    - resolved_freq: 解析出的频率字符串
+    """
     input_cfg = cfg["input"]
     infer_cfg = cfg["inference"]
 
@@ -167,6 +210,7 @@ def resolve_context_and_timestamps(cfg: Dict[str, Any], df: pd.DataFrame) -> tup
     timestamp_mode = str(input_cfg.get("timestamp_mode", "auto_extrapolate")).strip().lower()
 
     if timestamp_mode == "auto_extrapolate":
+        # 使用历史窗口并自动外推未来时间戳
         context_df = df.tail(lookback_window).copy()
         x_timestamp = pd.to_datetime(context_df[time_col])
         y_timestamp = build_future_timestamps(
@@ -184,6 +228,7 @@ def resolve_context_and_timestamps(cfg: Dict[str, Any], df: pd.DataFrame) -> tup
     future_time_col = str(input_cfg.get("future_time_col", "") or time_col)
 
     if future_time_csv_path:
+        # 未来时间由独立 CSV 提供
         if not os.path.exists(future_time_csv_path):
             raise FileNotFoundError(f"Future time CSV not found: {future_time_csv_path}")
         future_df = pd.read_csv(future_time_csv_path)
@@ -208,6 +253,7 @@ def resolve_context_and_timestamps(cfg: Dict[str, Any], df: pd.DataFrame) -> tup
             f"timestamp_mode=future_window requires at least {required} rows in input CSV, got {len(df)}."
         )
 
+    # 未来时间由同一个 CSV 的尾部窗口切分得到
     window_df = df.tail(required).copy()
     context_df = window_df.iloc[:lookback_window].copy()
     future_df = window_df.iloc[lookback_window:lookback_window + pred_len].copy()
@@ -218,6 +264,7 @@ def resolve_context_and_timestamps(cfg: Dict[str, Any], df: pd.DataFrame) -> tup
 
 
 def apply_nan_policy(df: pd.DataFrame, columns: List[str], policy: str) -> pd.DataFrame:
+    """按策略处理缺失值。"""
     if policy not in {"error", "drop", "ffill"}:
         raise ValueError("nan_policy must be one of: error, drop, ffill")
 
@@ -234,6 +281,10 @@ def apply_nan_policy(df: pd.DataFrame, columns: List[str], policy: str) -> pd.Da
 
 
 def maybe_calc_extra_features(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    """按需计算 return 特征。
+
+    开启后会生成：open_return / close_return / hy_open_return / hy_close_return。
+    """
     if not enabled:
         return df
 
@@ -255,6 +306,15 @@ def maybe_calc_extra_features(df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
 
 
 def load_and_prepare_csv(cfg: Dict[str, Any], feature_cols: List[str]) -> pd.DataFrame:
+    """读取并预处理输入 CSV。
+
+    包括：
+    - 时间列解析与排序
+    - 可选特征工程
+    - 特征列存在性检查
+    - 缺失值处理
+    - 行数与 lookback_window 校验
+    """
     input_cfg = cfg["input"]
     csv_path = input_cfg["csv_path"]
     time_col = input_cfg["time_col"]
@@ -303,6 +363,7 @@ def run_autoregressive_api(
     feature_cols: List[str],
     cfg: Dict[str, Any],
 ) -> pd.DataFrame:
+    """执行自回归推理并返回反归一化后的预测 DataFrame。"""
     infer_cfg = cfg["inference"]
     device = resolve_device(infer_cfg["device"])
 
@@ -310,6 +371,7 @@ def run_autoregressive_api(
     predictor_model = predictor_model.to(device)
 
     model_d_in = int(getattr(tokenizer, "d_in"))
+    # 关键约束：输入特征维度必须与 tokenizer 训练时 d_in 一致
     if model_d_in != len(feature_cols):
         raise ValueError(
             f"Tokenizer d_in ({model_d_in}) does not match feature count ({len(feature_cols)})."
@@ -345,6 +407,7 @@ def run_autoregressive_api(
     )
 
     preds = preds[:, -int(infer_cfg["pred_len"]):, :].squeeze(0)
+    # 还原到原始尺度
     preds = preds * (x_std + 1e-5) + x_mean
     pred_df = pd.DataFrame(preds, columns=feature_cols, index=y_timestamp)
     return pred_df
@@ -356,6 +419,15 @@ def compute_signal_results(
     cfg: Dict[str, Any],
     time_col: str,
 ) -> tuple[Dict[str, Any] | None, pd.DataFrame | None]:
+    """生成可选 signal 输出。
+
+    - close: signal_t = pred_close_t - last_context_close
+    - close_return: signal_t = cumsum(pred_close_return)_t
+
+    返回：
+    - signal_dict: 汇总统计（last/mean/max/min）
+    - signal_series_df: 逐步信号曲线（time, step, signal）
+    """
     signal_cfg = cfg.get("signal", {})
     if not bool(signal_cfg.get("enabled", False)):
         return None, None
@@ -411,6 +483,7 @@ def save_outputs(
     signal_dict: Dict[str, Any] | None,
     signal_series_df: pd.DataFrame | None,
 ) -> Dict[str, str]:
+    """落盘输出文件并返回路径字典。"""
     output_cfg = cfg["output"]
     input_cfg = cfg["input"]
     infer_cfg = cfg["inference"]
@@ -459,6 +532,7 @@ def save_outputs(
     saved_paths = {"csv": str(csv_path), "json": str(json_path)}
 
     if signal_dict is not None:
+        # 信号汇总（last/mean/max/min）
         signal_json_path = save_dir / f"{prefix}_{now_str}_signals.json"
         with open(signal_json_path, "w", encoding="utf-8") as f:
             json.dump(signal_dict, f, ensure_ascii=False, indent=2)
@@ -466,6 +540,7 @@ def save_outputs(
 
         signal_cfg = cfg.get("signal", {})
         if bool(signal_cfg.get("save_series", True)) and signal_series_df is not None:
+            # 信号逐步轨迹
             signal_csv_path = save_dir / f"{prefix}_{now_str}_signal_series.csv"
             signal_series_df.to_csv(signal_csv_path, index=False, float_format=f"%.{int(output_cfg['float_precision'])}f")
             saved_paths["signal_csv"] = str(signal_csv_path)
@@ -474,6 +549,7 @@ def save_outputs(
 
 
 def main() -> None:
+    """CLI 主入口。"""
     parser = argparse.ArgumentParser(description="Run Kronos inference from CSV with YAML config")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     args = parser.parse_args()
