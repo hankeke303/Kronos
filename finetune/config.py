@@ -233,12 +233,13 @@ class Config:
         self.inference_top_p = 0.9
         self.inference_top_k = 0
         self.inference_sample_count = 5
+        self.inference_use_kv_cache = True
         self.backtest_batch_size = 1000
         self.backtest_benchmark = self._set_benchmark(self.instrument)
         # 是否允许在序列起始阶段使用“不满 lookback_window 的上下文”。
         # False: 与原逻辑一致，必须凑满 lookback_window 才会产出该时点的信号。
         # True: 允许从数据起点截取到当前锚点，尽早生成信号，减少开头缺口。
-        self.backtest_allow_partial_context = True
+        self.backtest_allow_partial_context = False
         
         # =================================================================
         # New added by ZMJ
@@ -251,7 +252,7 @@ class Config:
         if self.backtest_allow_partial_context:
             self.backtest_save_folder_name += '_partialctx'
             
-        self.backtest_save_folder_name += "_by_data_20260409"
+        self.backtest_save_folder_name += "_by_data_20260409" + "_test_kvcache"
 
     def _set_benchmark(self, instrument):
         dt_benchmark = {

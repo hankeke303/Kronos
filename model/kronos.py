@@ -282,7 +282,16 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
 
-    def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
+    def decode_s1(
+        self,
+        s1_ids,
+        s2_ids,
+        stamp=None,
+        padding_mask=None,
+        kv_cache=None,
+        position_offset=0,
+        return_kv_cache=False,
+    ):
         """
         Decodes only the s1 tokens.
 
@@ -294,11 +303,16 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             s2_ids (torch.Tensor): Input tensor of s2 token IDs. Shape: [batch_size, seq_len]
             stamp (torch.Tensor, optional): Temporal stamp tensor. Shape: [batch_size, seq_len]. Defaults to None.
             padding_mask (torch.Tensor, optional): Mask for padding tokens. Shape: [batch_size, seq_len]. Defaults to None.
+            kv_cache (list[tuple[torch.Tensor, torch.Tensor]] | None, optional):
+                每层历史 K/V cache，启用后走增量解码路径。Defaults to None.
+            position_offset (int, optional): 新输入 token 的位置偏移。Defaults to 0.
+            return_kv_cache (bool, optional): 是否返回更新后的 KV cache。Defaults to False.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor] or Tuple[torch.Tensor, torch.Tensor, list]:
                 - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
                 - context: Context representation from the Transformer. Shape: [batch_size, seq_len, d_model]
+                - new_kv_cache (optional): 每层更新后的 KV cache。
         """
         x = self.embedding([s1_ids, s2_ids])
         if stamp is not None:
@@ -306,15 +320,39 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             x = x + time_embedding
         x = self.token_drop(x)
 
-        for layer in self.transformer:
-            x = layer(x, key_padding_mask=padding_mask)
+        use_cache_path = return_kv_cache or (kv_cache is not None)
+        if not use_cache_path:
+            for layer in self.transformer:
+                x = layer(x, key_padding_mask=padding_mask)
+            x = self.norm(x)
+            s1_logits = self.head(x)
+            return s1_logits, x
+
+        if kv_cache is None:
+            kv_cache = [None] * len(self.transformer)
+
+        new_kv_cache = []
+        for layer_idx, layer in enumerate(self.transformer):
+            layer_cache = kv_cache[layer_idx] if layer_idx < len(kv_cache) else None
+            if layer_cache is None:
+                past_k, past_v = None, None
+            else:
+                past_k, past_v = layer_cache
+
+            x, new_k, new_v = layer.forward_with_cache(
+                x,
+                past_k=past_k,
+                past_v=past_v,
+                key_padding_mask=padding_mask,
+                position_offset=position_offset,
+            )
+            new_kv_cache.append((new_k, new_v))
 
         x = self.norm(x)
-
         s1_logits = self.head(x)
-        return s1_logits, x
+        return s1_logits, x, new_kv_cache
 
-    def decode_s2(self, context, s1_ids, padding_mask=None):
+    def decode_s2(self, context, s1_ids, padding_mask=None, kv_cache=None, append_kv=False, return_kv_cache=False):
         """
         Decodes the s2 tokens, conditioned on the context and s1 tokens.
 
@@ -326,13 +364,33 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
                                      Shape: [batch_size, seq_len, d_model]
             s1_ids (torch.torch.Tensor): Input tensor of s1 token IDs. Shape: [batch_size, seq_len]
             padding_mask (torch.Tensor, optional): Mask for padding tokens. Shape: [batch_size, seq_len]. Defaults to None.
+            kv_cache (tuple[torch.Tensor, torch.Tensor] | None, optional): Cross-attention 的 K/V cache。
+            append_kv (bool, optional): 是否将本次 context 追加进 kv_cache。Defaults to False.
+            return_kv_cache (bool, optional): 是否返回更新后的 kv_cache。Defaults to False.
 
         Returns:
-            torch.Tensor: s2 logits. Shape: [batch_size, seq_len, s2_vocab_size]
+            torch.Tensor or tuple[torch.Tensor, tuple]:
+                - s2 logits
+                - 可选返回更新后的 kv_cache
         """
         sibling_embed = self.embedding.emb_s1(s1_ids)
-        x2 = self.dep_layer(context, sibling_embed, key_padding_mask=padding_mask)
-        return self.head.cond_forward(x2)
+        use_cache_path = return_kv_cache or (kv_cache is not None)
+        if not use_cache_path:
+            x2 = self.dep_layer(context, sibling_embed, key_padding_mask=padding_mask)
+            return self.head.cond_forward(x2)
+
+        if kv_cache is None:
+            append_kv = True
+
+        x2, new_kv_cache = self.dep_layer.forward_with_kv_cache(
+            context,
+            sibling_embed,
+            key_padding_mask=padding_mask,
+            kv_cache=kv_cache,
+            append_kv=append_kv,
+        )
+        s2_logits = self.head.cond_forward(x2)
+        return s2_logits, new_kv_cache
 
 
 def top_k_top_p_filtering(
@@ -401,7 +459,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, context_lens=None):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, context_lens=None, use_kv_cache=True):
     with torch.no_grad():
         batch_size = x.size(0)
         initial_seq_len = x.size(1)
@@ -437,34 +495,133 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
             ran = trange
         else:
             ran = range
-        for i in ran(pred_len):
-            current_seq_len = initial_seq_len + i
+        if not use_kv_cache:
+            for i in ran(pred_len):
+                current_seq_len = initial_seq_len + i
 
-            if current_seq_len <= max_context:
-                input_tokens = x_token
-                input_padding_mask = padding_mask
-            else:
-                input_tokens = [t[:, -max_context:].contiguous() for t in x_token]
-                input_padding_mask = padding_mask[:, -max_context:].contiguous()
+                if current_seq_len <= max_context:
+                    input_tokens = x_token
+                    input_padding_mask = padding_mask
+                else:
+                    input_tokens = [t[:, -max_context:].contiguous() for t in x_token]
+                    input_padding_mask = padding_mask[:, -max_context:].contiguous()
 
-            current_stamp = get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, i)
+                current_stamp = get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, i)
 
-            s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp, input_padding_mask)
-            s1_logits = s1_logits[:, -1, :]
-            sample_pre = sample_from_logits(s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+                s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp, input_padding_mask)
+                s1_logits = s1_logits[:, -1, :]
+                sample_pre = sample_from_logits(s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
-            s2_logits = model.decode_s2(context, sample_pre, input_padding_mask)
-            s2_logits = s2_logits[:, -1, :]
-            sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+                s2_logits = model.decode_s2(context, sample_pre, input_padding_mask)
+                s2_logits = s2_logits[:, -1, :]
+                sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
-            x_token[0] = torch.cat([x_token[0], sample_pre], dim=1)
-            x_token[1] = torch.cat([x_token[1], sample_post], dim=1)
-            padding_mask = torch.cat(
-                [padding_mask, torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=device)],
-                dim=1,
+                x_token[0] = torch.cat([x_token[0], sample_pre], dim=1)
+                x_token[1] = torch.cat([x_token[1], sample_post], dim=1)
+                padding_mask = torch.cat(
+                    [padding_mask, torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+
+        else:
+            def trim_kv_cache(kv_cache, keep_len):
+                if kv_cache is None:
+                    return None
+                trimmed_cache = []
+                for layer_cache in kv_cache:
+                    if layer_cache is None:
+                        trimmed_cache.append(None)
+                        continue
+                    k, v = layer_cache
+                    if keep_len <= 0:
+                        trimmed_cache.append((k[:, :, :0, :].contiguous(), v[:, :, :0, :].contiguous()))
+                    else:
+                        trimmed_cache.append((k[:, :, -keep_len:, :].contiguous(), v[:, :, -keep_len:, :].contiguous()))
+                return trimmed_cache
+
+            def trim_dep_kv_cache(dep_kv_cache, keep_len):
+                if dep_kv_cache is None:
+                    return None
+                k, v = dep_kv_cache
+                if keep_len <= 0:
+                    return k[:, :, :0, :].contiguous(), v[:, :, :0, :].contiguous()
+                return k[:, :, -keep_len:, :].contiguous(), v[:, :, -keep_len:, :].contiguous()
+
+            # Prefill 一次上下文，后续每步只对“新 token”做增量计算。
+            effective_len = min(initial_seq_len, max_context)
+            x_token = [
+                x_token[0][:, -effective_len:].contiguous(),
+                x_token[1][:, -effective_len:].contiguous(),
+            ]
+            current_stamp = x_stamp[:, -effective_len:, :].contiguous()
+            current_padding_mask = padding_mask[:, -effective_len:].contiguous()
+
+            s1_logits, context_cache, kv_cache = model.decode_s1(
+                x_token[0],
+                x_token[1],
+                stamp=current_stamp,
+                padding_mask=current_padding_mask,
+                kv_cache=None,
+                position_offset=0,
+                return_kv_cache=True,
             )
+            dep_kv_cache = None
+            dep_context_delta = context_cache
 
-            torch.cuda.empty_cache()
+            for i in ran(pred_len):
+                next_s1_logits = s1_logits[:, -1, :]
+                sample_pre = sample_from_logits(next_s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+
+                s2_logits, dep_kv_cache = model.decode_s2(
+                    dep_context_delta,
+                    sample_pre,
+                    current_padding_mask,
+                    kv_cache=dep_kv_cache,
+                    append_kv=True,
+                    return_kv_cache=True,
+                )
+                s2_logits = s2_logits[:, -1, :]
+                sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+
+                x_token[0] = torch.cat([x_token[0], sample_pre], dim=1)
+                x_token[1] = torch.cat([x_token[1], sample_post], dim=1)
+
+                if i == pred_len - 1:
+                    break
+
+                # 下一步解码前，保持滑动窗口长度不超过 max_context。
+                keep_past = min(context_cache.size(1), max_context - 1)
+                if keep_past <= 0:
+                    context_cache = context_cache[:, :0, :].contiguous()
+                    current_padding_mask = current_padding_mask[:, :0].contiguous()
+                else:
+                    context_cache = context_cache[:, -keep_past:, :].contiguous()
+                    current_padding_mask = current_padding_mask[:, -keep_past:].contiguous()
+
+                kv_cache = trim_kv_cache(kv_cache, keep_past)
+                dep_kv_cache = trim_dep_kv_cache(dep_kv_cache, keep_past)
+
+                # 新 token 的时间特征对应 y_stamp 第 i 步。
+                new_stamp = y_stamp[:, i:i + 1, :]
+                update_padding_mask = torch.cat(
+                    [current_padding_mask, torch.zeros((current_padding_mask.size(0), 1), dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+
+                s1_logits, new_context, kv_cache = model.decode_s1(
+                    sample_pre,
+                    sample_post,
+                    stamp=new_stamp,
+                    padding_mask=update_padding_mask,
+                    kv_cache=kv_cache,
+                    position_offset=max(keep_past, 0),
+                    return_kv_cache=True,
+                )
+
+                context_cache = torch.cat([context_cache, new_context], dim=1)
+                dep_context_delta = new_context
+                current_padding_mask = update_padding_mask
+
 
         input_tokens = [t[:, -max_context:].contiguous() for t in x_token]
         z = tokenizer.decode(input_tokens, half=True)

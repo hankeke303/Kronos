@@ -361,6 +361,7 @@ def generate_predictions(
                 top_p=config['top_p'],
                 sample_count=config['sample_count'],
                 context_lens=context_lens,
+                use_kv_cache=config.get('use_kv_cache', True),
             )
             # You can try commenting on this line to keep the history data
             preds = preds[:, -config['pred_len']:, :]
@@ -460,6 +461,7 @@ def main():
         'top_k': base_config.inference_top_k,
         'top_p': base_config.inference_top_p,
         'sample_count': base_config.inference_sample_count,
+        'use_kv_cache': getattr(base_config, 'inference_use_kv_cache', True),
         'batch_size': base_config.backtest_batch_size,
         # =================================================================
         # New added by ZMJ

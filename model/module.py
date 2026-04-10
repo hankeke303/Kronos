@@ -297,8 +297,12 @@ class RotaryPositionalEmbedding(nn.Module):
             self.sin_cached = emb.sin()[None, None, :, :]
         return self.cos_cached, self.sin_cached
 
-    def forward(self, q, k):
-        cos, sin = self._update_cos_sin_cache(q, q.shape[-2])
+    def forward(self, q, k, position_offset=0):
+        seq_len = q.shape[-2]
+        total_len = position_offset + seq_len
+        cos, sin = self._update_cos_sin_cache(q, total_len)
+        cos = cos[:, :, position_offset:position_offset + seq_len, :]
+        sin = sin[:, :, position_offset:position_offset + seq_len, :]
         return (
             (q * cos) + (self._rotate_half(q) * sin),
             (k * cos) + (self._rotate_half(k) * sin),
@@ -378,6 +382,46 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         return self.resid_dropout(self.out_proj(attn_output))
 
+    def forward_with_cache(self, x, past_k=None, past_v=None, key_padding_mask=None, position_offset=0):
+        """
+        增量前向：仅对新 token 计算 q/k/v，并与 past_k/past_v 拼接。
+        """
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k_new = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v_new = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        q, k_new = self.rotary(q, k_new, position_offset=position_offset)
+
+        if past_k is None:
+            k = k_new
+            v = v_new
+        else:
+            k = torch.cat([past_k, k_new], dim=2)
+            v = torch.cat([past_v, v_new], dim=2)
+
+        if key_padding_mask is not None:
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = attn_mask.expand(-1, self.n_heads, seq_len, -1)
+        else:
+            attn_mask = None
+
+        # 使用 cache 的增量步通常 query_len=1，不存在“未来位”，无需额外 causal mask。
+        use_causal = past_k is None
+        attn_output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout_p,
+            is_causal=use_causal,
+            training=self.training,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return self.resid_dropout(self.out_proj(attn_output)), k, v
+
 
 class MultiHeadCrossAttentionWithRoPE(nn.Module):
     def __init__(self, d_model, n_heads, attn_dropout_p=0.0, resid_dropout=0.0):
@@ -422,6 +466,59 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
         return self.resid_dropout(self.out_proj(attn_output))
+
+    def forward_with_kv_cache(self, query, key=None, value=None, key_padding_mask=None, kv_cache=None, append_kv=True):
+        """
+        Cross-Attention 的 KV cache 版本：
+        - kv_cache=None 时，使用完整 key/value 预填充；
+        - kv_cache!=None 且 append_kv=True 时，仅把新增 key/value 片段追加到缓存。
+        """
+        batch_size, q_len, _ = query.shape
+
+        q = self.q_proj(query).view(batch_size, q_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if kv_cache is None:
+            if key is None or value is None:
+                raise ValueError("key/value must be provided when kv_cache is None")
+            _, seq_len, _ = key.shape
+            k_new = self.k_proj(key).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+            v_new = self.v_proj(value).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+            q, k_new = self.rotary(q, k_new)
+            k, v = k_new, v_new
+        else:
+            cache_k, cache_v = kv_cache
+            if append_kv:
+                if key is None or value is None:
+                    raise ValueError("key/value must be provided when append_kv is True")
+                _, seq_len, _ = key.shape
+                k_new = self.k_proj(key).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+                v_new = self.v_proj(value).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+                q, k_new = self.rotary(q, k_new)
+                k = torch.cat([cache_k, k_new], dim=2)
+                v = torch.cat([cache_v, v_new], dim=2)
+            else:
+                # 仅更新 query 的 RoPE，相当于复用已有 key/value cache。
+                q, _ = self.rotary(q, q)
+                k, v = cache_k, cache_v
+
+        if key_padding_mask is not None:
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = attn_mask.expand(-1, self.n_heads, q_len, -1)
+        else:
+            attn_mask = None
+
+        attn_output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout_p,
+            is_causal=False,
+            training=self.training,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
+        return self.resid_dropout(self.out_proj(attn_output)), (k, v)
 
 
 class HierarchicalEmbedding(nn.Module):
@@ -488,6 +585,18 @@ class DependencyAwareLayer(nn.Module):
         )
         return self.norm(hidden_states + attn_out)
 
+    def forward_with_kv_cache(self, hidden_states, sibling_embed, key_padding_mask=None, kv_cache=None, append_kv=True):
+        attn_out, new_kv_cache = self.cross_attn.forward_with_kv_cache(
+            query=sibling_embed,
+            key=hidden_states,
+            value=hidden_states,
+            key_padding_mask=key_padding_mask,
+            kv_cache=kv_cache,
+            append_kv=append_kv,
+        )
+        # 与原 forward 的“取最后一个 context 位置输出”保持一致。
+        return self.norm(hidden_states[:, -1:, :] + attn_out), new_kv_cache
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, n_heads, ff_dim=1024, ffn_dropout_p=0.0, attn_dropout_p=0.0, resid_dropout_p=0.0):
@@ -508,6 +617,24 @@ class TransformerBlock(nn.Module):
         ffn_out = self.ffn(x)
         x = residual + ffn_out
         return x
+
+    def forward_with_cache(self, x, past_k=None, past_v=None, key_padding_mask=None, position_offset=0):
+        residual = x
+        x = self.norm1(x)
+        attn_out, new_k, new_v = self.self_attn.forward_with_cache(
+            x,
+            past_k=past_k,
+            past_v=past_v,
+            key_padding_mask=key_padding_mask,
+            position_offset=position_offset,
+        )
+        x = residual + attn_out
+
+        residual = x
+        x = self.norm2(x)
+        ffn_out = self.ffn(x)
+        x = residual + ffn_out
+        return x, new_k, new_v
 
 
 class DualHead(nn.Module):
