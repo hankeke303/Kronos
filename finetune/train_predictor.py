@@ -44,8 +44,9 @@ def compute_ccc_loss(pred, target):
     """
     # revised by ZMJ. 2026-1-17: Only compute CCC on close_return column (index 9)
     feature_idx = 9  # close_return column index
-    pred_feature = pred[:, :, feature_idx].reshape(-1)  # [N]
-    target_feature = target[:, :, feature_idx].reshape(-1)  # [N]
+    # Keep statistics in fp32 for stability under bf16 training.
+    pred_feature = pred[:, :, feature_idx].reshape(-1).float()  # [N]
+    target_feature = target[:, :, feature_idx].reshape(-1).float()  # [N]
     
     # Compute means and standard deviations
     pred_mean = pred_feature.mean()
@@ -69,6 +70,37 @@ def compute_ccc_loss(pred, target):
     ccc_loss = 1.0 - ccc
     
     return ccc_loss
+
+
+def decode_topk_weighted(tokenizer, s1_logits, s2_logits, top_k):
+    """
+    Decode weighted top-k token pairs in a vectorized way.
+    This keeps the same math as full-softmax->topk->renorm, but runs faster:
+    - topk on logits (equivalent ranking to probs)
+    - renormalize only inside top-k set
+    - single batched decode instead of K small decode calls
+    """
+    top_k_eff = min(top_k, s1_logits.shape[-1], s2_logits.shape[-1])
+
+    s1_topk_logits, s1_topk_indices = torch.topk(s1_logits, k=top_k_eff, dim=-1)
+    s2_topk_logits, s2_topk_indices = torch.topk(s2_logits, k=top_k_eff, dim=-1)
+
+    s1_topk_probs_norm = F.softmax(s1_topk_logits, dim=-1)
+    s2_topk_probs_norm = F.softmax(s2_topk_logits, dim=-1)
+
+    s1_tokens_all = s1_topk_indices.permute(2, 0, 1).reshape(-1, s1_logits.shape[1])
+    s2_tokens_all = s2_topk_indices.permute(2, 0, 1).reshape(-1, s2_logits.shape[1])
+    with torch.no_grad():
+        decoded_all = tokenizer.decode([s1_tokens_all, s2_tokens_all], half=True)
+    pred_values_stack = decoded_all.reshape(
+        top_k_eff, s1_logits.shape[0], s1_logits.shape[1], decoded_all.shape[-1]
+    )
+
+    weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)
+    weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)
+    weights_stack = weights_stack.unsqueeze(-1)
+
+    return (pred_values_stack * weights_stack).sum(dim=0)
 
 
 def create_dataloaders(config: dict, rank: int, world_size: int):
@@ -141,8 +173,11 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
     epochs_ran = 0
 
     metrics_csv_path = os.path.join(save_dir, "metrics.csv")
+    # top_k = 10
+    top_k = 3
     for epoch_idx in range(config['epochs']):
         epoch_start_time = time.time()
+        last_log_time = epoch_start_time
         model.train()
         train_loader.sampler.set_epoch(epoch_idx)
 
@@ -157,8 +192,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         epoch_combine_loss_sum = 0.0
 
         for i, (batch_x, batch_x_stamp) in enumerate(train_loader):
-            batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
-            batch_x_stamp = batch_x_stamp.squeeze(0).to(device, non_blocking=True)
+            batch_x = batch_x.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
+            batch_x_stamp = batch_x_stamp.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
 
             # Tokenize input data on-the-fly
             with torch.no_grad():
@@ -173,65 +208,32 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
             ce_loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
             # revised by ZMJ. 2026-1-17
-            # Get top-10 predicted tokens from logits using Straight-Through Estimator (STE)
+            # Get top-k predicted tokens from logits using Straight-Through Estimator (STE)
             # Forward: use topk indices (not differentiable), Backward: gradient flows through softmax probabilities
             s1_logits, s2_logits = logits[0], logits[1]  # [batch_size, seq_len, vocab_size]
             batch_size, seq_len = s1_logits.shape[0], s1_logits.shape[1]
+            half_start = seq_len // 2
+            s1_logits = s1_logits[:, half_start:, :]
+            s2_logits = s2_logits[:, half_start:, :]
             
-            # Use softmax to get probabilities (differentiable)
-            top_k = 10
-            s1_probs = F.softmax(s1_logits, dim=-1)  # [batch_size, seq_len, vocab_size]
-            s2_probs = F.softmax(s2_logits, dim=-1)  # [batch_size, seq_len, vocab_size]
-            
-            # Get top-k indices and their probabilities
-            s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)  # [batch_size, seq_len, top_k]
-            s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)  # [batch_size, seq_len, top_k]
-            
-            # Normalize probabilities to sum to 1 for each position (differentiable)
-            s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-            s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-            
-            # Decode each top-k token pair
-            # Note: topk indices are not differentiable, but we use STE:
-            # Forward: use indices for decode, Backward: gradient flows through probabilities
-            pred_values_list = []
-            for k_idx in range(min(top_k, s1_logits.shape[-1])):
-                # Use indices for forward pass (not differentiable, but that's OK)
-                s1_tokens_k = s1_topk_indices[:, :, k_idx]  # [batch_size, seq_len]
-                s2_tokens_k = s2_topk_indices[:, :, k_idx]  # [batch_size, seq_len]
-                decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)  # [batch_size, seq_len, d_in]
-                pred_values_list.append(decoded_k)
-            
-            # Stack decoded values
-            pred_values_stack = torch.stack(pred_values_list, dim=0)  # [top_k, batch_size, seq_len, d_in]
-            
-            # Use softmax probabilities as weights (differentiable - gradient flows through this to logits)
-            # Create weight matrix: [top_k, batch_size, seq_len]
-            weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)  # [top_k, batch_size, seq_len]
-            weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)  # Normalize
-            weights_stack = weights_stack.unsqueeze(-1)  # [top_k, batch_size, seq_len, 1]
-            
-            # Weighted sum: gradient flows through weights (probabilities) back to logits
-            # Even though decoded values come from non-differentiable indices,
-            # the gradient flows through the differentiable weights (probabilities)
-            pred_values = (pred_values_stack * weights_stack).sum(dim=0)  # [batch_size, seq_len, d_in]
+            # Use top-k decode with STE weights (vectorized for speed/memory)
+            pred_values = decode_topk_weighted(tokenizer, s1_logits, s2_logits, top_k)
             
             # Get true values corresponding to token_out positions (batch_x[:, 1:])
-            true_values = batch_x[:, 1:, :]  # [batch_size, seq_len, d_in]
+            true_values = batch_x[:, 1 + half_start:, :]  # [batch_size, seq_len/2, d_in]
             
             # Compute CCC loss
             ccc_loss = compute_ccc_loss(pred_values, true_values)
             
             # Combine original loss and CCC loss (average)
-            combine_loss = ccc_loss
+            combine_loss = (ccc_loss + ce_loss) / 2.0
 
             # Backward pass and optimization
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             combine_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
             optimizer.step()
-            # scheduler.step()
-            scheduler.step(epoch_idx + i / num_iters)
+            scheduler.step()
 
             # Logging (Master Process Only)
             batch_ce_loss_value = ce_loss.item()
@@ -243,9 +245,16 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
             epoch_combine_loss_sum += batch_loss_value
             if rank == 0 and (batch_idx_global + 1) % config['log_interval'] == 0:
                 lr = optimizer.param_groups[0]['lr']
+                now = time.time()
+                interval_steps = config['log_interval']
+                interval_time = now - last_log_time
+                step_time = interval_time / max(interval_steps, 1)
+                epoch_elapsed = now - epoch_start_time
+                last_log_time = now
                 print(
                     f"[Rank {rank}, Epoch {epoch_idx + 1}/{config['epochs']}, Step {i + 1}/{len(train_loader)}] "
-                    f"LR {lr:.6f}, Combine Loss: {batch_loss_value:.4f}, CE Loss: {batch_ce_loss_value:.4f}, CCC Loss: {batch_ccc_loss_value:.4f}"
+                    f"LR {lr:.6f}, Combine Loss: {batch_loss_value:.4f}, CE Loss: {batch_ce_loss_value:.4f}, CCC Loss: {batch_ccc_loss_value:.4f}, "
+                    f"Step Time: {step_time:.4f}s, Interval Time: {format_time(interval_time)}, Epoch Elapsed: {format_time(epoch_elapsed)}"
                 )
             if rank == 0 and logger:
                 lr = optimizer.param_groups[0]['lr']
@@ -266,8 +275,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         val_batches_processed_rank = 0
         with torch.no_grad():
             for batch_x, batch_x_stamp in val_loader:
-                batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
-                batch_x_stamp = batch_x_stamp.squeeze(0).to(device, non_blocking=True)
+                batch_x = batch_x.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
@@ -277,31 +286,15 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 ce_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
                 # Compute CCC loss for validation
-                with torch.no_grad():
-                    top_k = 10
-                    s1_logits, s2_logits = logits[0], logits[1]
-                    s1_probs = F.softmax(s1_logits, dim=-1)
-                    s2_probs = F.softmax(s2_logits, dim=-1)
-                    s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)
-                    s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)
-                    s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                    s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                    
-                    pred_values_list = []
-                    for k_idx in range(min(top_k, s1_logits.shape[-1])):
-                        s1_tokens_k = s1_topk_indices[:, :, k_idx]
-                        s2_tokens_k = s2_topk_indices[:, :, k_idx]
-                        decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)
-                        pred_values_list.append(decoded_k)
-                    
-                    pred_values_stack = torch.stack(pred_values_list, dim=0)
-                    weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)
-                    weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)
-                    weights_stack = weights_stack.unsqueeze(-1)
-                    pred_values = (pred_values_stack * weights_stack).sum(dim=0)
-                    true_values = batch_x[:, 1:, :]
-                    ccc_loss = compute_ccc_loss(pred_values, true_values)
-                    combine_loss = ccc_loss
+                s1_logits, s2_logits = logits[0], logits[1]
+                seq_len = s1_logits.shape[1]
+                half_start = seq_len // 2
+                s1_logits = s1_logits[:, half_start:, :]
+                s2_logits = s2_logits[:, half_start:, :]
+                pred_values = decode_topk_weighted(tokenizer, s1_logits, s2_logits, top_k)
+                true_values = batch_x[:, 1 + half_start:, :]
+                ccc_loss = compute_ccc_loss(pred_values, true_values)
+                combine_loss = (ccc_loss + ce_loss) / 2.0
 
                 tot_val_ce_loss_rank += ce_loss.item()
                 tot_val_ccc_loss_rank += ccc_loss.item()
@@ -326,8 +319,8 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
         test_batches_processed_rank = 0
         with torch.no_grad():
             for batch_x, batch_x_stamp in test_loader:
-                batch_x = batch_x.squeeze(0).to(device, non_blocking=True)
-                batch_x_stamp = batch_x_stamp.squeeze(0).to(device, non_blocking=True)
+                batch_x = batch_x.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
+                batch_x_stamp = batch_x_stamp.squeeze(0).to(device, dtype=torch.bfloat16, non_blocking=True)
 
                 token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
@@ -337,31 +330,15 @@ def train_model(model, tokenizer, device, config, save_dir, logger, rank, world_
                 ce_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
 
                 # Compute CCC loss for test
-                with torch.no_grad():
-                    top_k = 10
-                    s1_logits, s2_logits = logits[0], logits[1]
-                    s1_probs = F.softmax(s1_logits, dim=-1)
-                    s2_probs = F.softmax(s2_logits, dim=-1)
-                    s1_topk_probs, s1_topk_indices = torch.topk(s1_probs, k=min(top_k, s1_logits.shape[-1]), dim=-1)
-                    s2_topk_probs, s2_topk_indices = torch.topk(s2_probs, k=min(top_k, s2_logits.shape[-1]), dim=-1)
-                    s1_topk_probs_norm = s1_topk_probs / (s1_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                    s2_topk_probs_norm = s2_topk_probs / (s2_topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
-                    
-                    pred_values_list = []
-                    for k_idx in range(min(top_k, s1_logits.shape[-1])):
-                        s1_tokens_k = s1_topk_indices[:, :, k_idx]
-                        s2_tokens_k = s2_topk_indices[:, :, k_idx]
-                        decoded_k = tokenizer.decode([s1_tokens_k, s2_tokens_k], half=True)
-                        pred_values_list.append(decoded_k)
-                    
-                    pred_values_stack = torch.stack(pred_values_list, dim=0)
-                    weights_stack = s1_topk_probs_norm.permute(2, 0, 1) * s2_topk_probs_norm.permute(2, 0, 1)
-                    weights_stack = weights_stack / (weights_stack.sum(dim=0, keepdim=True) + 1e-8)
-                    weights_stack = weights_stack.unsqueeze(-1)
-                    pred_values = (pred_values_stack * weights_stack).sum(dim=0)
-                    true_values = batch_x[:, 1:, :]
-                    ccc_loss = compute_ccc_loss(pred_values, true_values)
-                    combine_loss = ccc_loss
+                s1_logits, s2_logits = logits[0], logits[1]
+                seq_len = s1_logits.shape[1]
+                half_start = seq_len // 2
+                s1_logits = s1_logits[:, half_start:, :]
+                s2_logits = s2_logits[:, half_start:, :]
+                pred_values = decode_topk_weighted(tokenizer, s1_logits, s2_logits, top_k)
+                true_values = batch_x[:, 1 + half_start:, :]
+                ccc_loss = compute_ccc_loss(pred_values, true_values)
+                combine_loss = (ccc_loss + ce_loss) / 2.0
 
                 tot_test_ce_loss_rank += ce_loss.item()
                 tot_test_ccc_loss_rank += ccc_loss.item()
@@ -489,13 +466,13 @@ def main(config: dict, mode: str = 'finetune', init: str = 'pretrained', tokeniz
 
     # Model Initialization
     tokenizer = KronosTokenizer.from_pretrained(config['finetuned_tokenizer_path'])
-    tokenizer.eval().to(device)
+    tokenizer.eval().to(device=device, dtype=torch.bfloat16)
     if init == 'scratch':
         model = _build_predictor_from_scratch(config)
     else:
         load_path = predictor_path_override or config['pretrained_predictor_path']
         model = Kronos.from_pretrained(load_path)
-    model.to(device)
+    model.to(device=device, dtype=torch.bfloat16)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if rank == 0:

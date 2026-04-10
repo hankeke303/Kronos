@@ -15,12 +15,36 @@ def calc_extra_features(data):
     """
 
     def _augment(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        # Normalize time information to a unified 'datetime' column.
+        if "datetime" in df.columns:
+            datetime_values = df["datetime"]
+        elif "date" in df.columns:
+            datetime_values = df["date"]
+        elif isinstance(df.index, pd.MultiIndex):
+            if "datetime" in df.index.names:
+                datetime_values = df.index.get_level_values("datetime")
+            elif "date" in df.index.names:
+                datetime_values = df.index.get_level_values("date")
+            else:
+                raise KeyError("DataFrame must contain 'datetime' or 'date' column/index for time features.")
+        elif isinstance(df.index, pd.DatetimeIndex) or df.index.name in {"datetime", "date"}:
+            datetime_values = df.index
+        else:
+            raise KeyError("DataFrame must contain 'datetime' or 'date' column/index for time features.")
+
+        df["datetime"] = pd.to_datetime(datetime_values, errors="raise")
+
+        if all(col in df.columns for col in ["open_return", "close_return", "hy_open_return", "hy_close_return"]):
+            # Assume features are already calculated if these columns exist.
+            return df
+        
         required_cols = ["open", "close", "hy_open", "hy_close"]
         missing = [col for col in required_cols if col not in df.columns]
         if missing:
             raise KeyError(f"Missing required columns for return calc: {missing}")
 
-        df = df.copy()
         # Simple arithmetic returns: (today - yesterday) / yesterday.
         df["open_return"] = df["open"].pct_change()
         df["close_return"] = df["close"].pct_change()

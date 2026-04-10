@@ -78,10 +78,10 @@ class Config:
         self.train_time_range = ["2005-01-04", "2022-12-31"]
         self.val_time_range = ["2022-09-01", "2024-06-30"]
         self.test_time_range = ["2024-04-01", "2025-11-07"]
-        self.backtest_time_range = ["2024-12-24", "2025-11-07"]
+        self.backtest_time_range = ["2024-07-01", "2025-11-06"]
 
         # TODO: Directory to save the processed, pickled datasets.
-        self.dataset_path = "~/workspace/kronos/20260409"
+        self.dataset_path = "./data/processed_datasets_110"
         # self.dataset_path = "./data/processed_datasets_cleaned_6"
 
         # =================================================================
@@ -242,8 +242,6 @@ class Config:
         self.backtest_pred = 'close_return'    # supported: 'close' or 'close_return' now, 20260112
         if self.backtest_pred == 'close_return':
             self.backtest_save_folder_name += '_closereturn'
-            
-        self.backtest_save_folder_name += "_by_data_20260409"
 
     def _set_benchmark(self, instrument):
         dt_benchmark = {

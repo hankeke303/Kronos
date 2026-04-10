@@ -170,6 +170,11 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
             torch.Tensor: Reconstructed output tensor of shape (batch_size, seq_len, d_in).
         """
         quantized = self.indices_to_bits(x, half)
+        # Align decode input dtype/device with linear weights (important for bf16 training).
+        quantized = quantized.to(
+            device=self.post_quant_embed.weight.device,
+            dtype=self.post_quant_embed.weight.dtype
+        )
         z = self.post_quant_embed(quantized)
         for layer in self.decoder:
             z = layer(z)

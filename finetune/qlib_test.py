@@ -49,6 +49,8 @@ class QlibTestDataset(Dataset):
         self.feature_list = config.feature_list
         self.time_feature_list = config.time_feature_list
         self.indices = []
+        self.backtest_start = pd.Timestamp(config.backtest_time_range[0])
+        self.backtest_end = pd.Timestamp(config.backtest_time_range[1])
         
         self.data = calc_extra_features(self.data)
 
@@ -67,7 +69,10 @@ class QlibTestDataset(Dataset):
             if num_samples > 0:
                 for i in range(num_samples):
                     timestamp = df.iloc[i + self.config.lookback_window - 1]['datetime']
-                    self.indices.append((symbol, i, timestamp))
+                    if self.backtest_start <= pd.Timestamp(timestamp) <= self.backtest_end:
+                        self.indices.append((symbol, i, timestamp))
+
+        print(f"Filtered inference windows by backtest range [{self.backtest_start.date()} - {self.backtest_end.date()}], total samples: {len(self.indices)}")
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -261,6 +266,7 @@ def collate_fn_for_inference(batch):
 def generate_predictions(
     config: dict,
     test_data: dict,
+    data_config: Config,
     device: torch.device,
     rank: int,
     world_size: int,
@@ -285,7 +291,7 @@ def generate_predictions(
     tokenizer, model = load_models(config, device, rank)
 
     # Use the Dataset and DataLoader for efficient batching and processing
-    dataset = QlibTestDataset(data=test_data, config=Config())
+    dataset = QlibTestDataset(data=test_data, config=data_config)
     if world_size > 1:
         indices = list(range(rank, len(dataset), world_size))
         data_source = Subset(dataset, indices)
@@ -423,6 +429,7 @@ def main():
     split_paths = [
         # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
         ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+        # ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
     ]
     split_data = {}
     for split_name, split_path in split_paths:
@@ -454,7 +461,7 @@ def main():
     #     print(test_data)
 
     # --- 3. Generate Predictions ---
-    model_preds = generate_predictions(run_config, test_data, device, rank, world_size)
+    model_preds = generate_predictions(run_config, test_data, base_config, device, rank, world_size)
 
     if ddp_enabled and dist.is_initialized():
         dist.barrier()
