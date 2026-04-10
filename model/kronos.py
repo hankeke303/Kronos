@@ -139,20 +139,22 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         x = x * q_scale
         return x
 
-    def encode(self, x, half=False):
+    def encode(self, x, half=False, padding_mask=None):
         """
         Encodes the input data into quantized indices.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_in).
             half (bool, optional): Whether to use half quantization in BSQuantizer. Defaults to False.
+            padding_mask (torch.Tensor, optional): Bool mask of shape (batch_size, seq_len),
+                where True indicates padded positions to ignore in attention.
 
         Returns:
             torch.Tensor: Quantized indices from BSQuantizer.
         """
         z = self.embed(x)
         for layer in self.encoder:
-            z = layer(z)
+            z = layer(z, key_padding_mask=padding_mask)
         z = self.quant_embed(z)
 
         bsq_loss, quantized, z_indices = self.tokenizer(z, half)
@@ -382,6 +384,14 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
             logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
 
     probs = F.softmax(logits, dim=-1)
+    # CUDA 上 multinomial 对 NaN/Inf/全零概率会触发 device-side assert，这里做兜底清洗。
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    invalid_rows = probs_sum.squeeze(-1) <= 0
+    if invalid_rows.any():
+        probs[invalid_rows] = 1.0 / probs.size(-1)
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+    probs = probs / probs_sum
 
     if not sample_logits:
         _, x = top_k(probs, k=1, dim=-1)
@@ -391,18 +401,29 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, context_lens=None):
     with torch.no_grad():
         batch_size = x.size(0)
         initial_seq_len = x.size(1)
         x = torch.clip(x, -clip, clip)
 
         device = x.device
+
+        if context_lens is None:
+            context_lens = torch.full((batch_size,), initial_seq_len, dtype=torch.long, device=device)
+        else:
+            context_lens = context_lens.to(device=device, dtype=torch.long)
+
+        # 左侧 padding：True 表示该时间步是 padding，推理时在注意力中屏蔽。
+        base_positions = torch.arange(initial_seq_len, device=device).unsqueeze(0)
+        padding_mask = base_positions < (initial_seq_len - context_lens.unsqueeze(1))
+
         x = x.unsqueeze(1).repeat(1, sample_count, 1, 1).reshape(-1, x.size(1), x.size(2)).to(device)
         x_stamp = x_stamp.unsqueeze(1).repeat(1, sample_count, 1, 1).reshape(-1, x_stamp.size(1), x_stamp.size(2)).to(device)
         y_stamp = y_stamp.unsqueeze(1).repeat(1, sample_count, 1, 1).reshape(-1, y_stamp.size(1), y_stamp.size(2)).to(device)
+        padding_mask = padding_mask.unsqueeze(1).repeat(1, sample_count, 1).reshape(-1, initial_seq_len)
 
-        x_token = tokenizer.encode(x, half=True)
+        x_token = tokenizer.encode(x, half=True, padding_mask=padding_mask)
 
         def get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, pred_step):
 
@@ -421,21 +442,27 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
 
             if current_seq_len <= max_context:
                 input_tokens = x_token
+                input_padding_mask = padding_mask
             else:
                 input_tokens = [t[:, -max_context:].contiguous() for t in x_token]
+                input_padding_mask = padding_mask[:, -max_context:].contiguous()
 
             current_stamp = get_dynamic_stamp(x_stamp, y_stamp, current_seq_len, i)
 
-            s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp)
+            s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp, input_padding_mask)
             s1_logits = s1_logits[:, -1, :]
             sample_pre = sample_from_logits(s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
-            s2_logits = model.decode_s2(context, sample_pre)
+            s2_logits = model.decode_s2(context, sample_pre, input_padding_mask)
             s2_logits = s2_logits[:, -1, :]
             sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
             x_token[0] = torch.cat([x_token[0], sample_pre], dim=1)
             x_token[1] = torch.cat([x_token[1], sample_post], dim=1)
+            padding_mask = torch.cat(
+                [padding_mask, torch.zeros((padding_mask.size(0), 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
 
             torch.cuda.empty_cache()
 

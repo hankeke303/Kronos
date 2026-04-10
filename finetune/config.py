@@ -78,7 +78,7 @@ class Config:
         self.train_time_range = ["2005-01-04", "2022-12-31"]
         self.val_time_range = ["2022-09-01", "2024-06-30"]
         self.test_time_range = ["2024-04-01", "2025-11-07"]
-        self.backtest_time_range = ["2024-12-24", "2025-11-07"]
+        self.backtest_time_range = ["2024-07-01", "2025-11-07"]
 
         # TODO: Directory to save the processed, pickled datasets.
         self.dataset_path = "~/workspace/kronos/20260409"

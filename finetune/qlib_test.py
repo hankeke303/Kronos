@@ -276,13 +276,27 @@ def collate_fn_for_inference(batch):
                       QlibTestDataset.__getitem__.
 
     Returns:
-        A single tuple containing lists of tensors and metadata.
+        A single tuple containing padded tensors and metadata.
     """
     # Unzip the list of samples into separate lists for each data type
     x, x_stamp, y_stamp, symbols, timestamps, context_lens = zip(*batch)
 
-    # Keep variable-length context windows as lists and batch later by context length.
-    return list(x), list(x_stamp), list(y_stamp), list(symbols), list(timestamps), list(context_lens)
+    # 采用左侧 padding 对齐变长上下文，保持最后一个时间步始终是“当前锚点”。
+    max_context_len = max(int(v) for v in context_lens)
+
+    def left_pad_to_len(tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        pad_len = target_len - tensor.size(0)
+        if pad_len <= 0:
+            return tensor
+        pad = torch.zeros((pad_len, tensor.size(1)), dtype=tensor.dtype)
+        return torch.cat([pad, tensor], dim=0)
+
+    x_batch = torch.stack([left_pad_to_len(v, max_context_len) for v in x], dim=0)
+    x_stamp_batch = torch.stack([left_pad_to_len(v, max_context_len) for v in x_stamp], dim=0)
+    y_stamp_batch = torch.stack(y_stamp, dim=0)
+    context_lens_tensor = torch.tensor(context_lens, dtype=torch.long)
+
+    return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(timestamps), context_lens_tensor
 
 
 def generate_predictions(
@@ -332,61 +346,49 @@ def generate_predictions(
     results = defaultdict(list)
     with torch.no_grad():
         for x, x_stamp, y_stamp, symbols, timestamps, context_lens in tqdm(loader, desc="Inference", disable=(rank != 0)):
-            # 同一个 DataLoader batch 内，样本可能来自不同锚点，context_len 可能不一致。
-            # 这里按 context_len 分组，保证每次送入模型的一组样本长度一致。
-            grouped_indices = defaultdict(list)
-            for sample_idx, context_len in enumerate(context_lens):
-                # sample_idx: 当前样本在本批次中的位置；context_len: 该样本上下文实际长度。
-                grouped_indices[int(context_len)].append(sample_idx)
+            # 这里直接走“padding + mask”路径，不再按长度拆分子批次。
+            preds = auto_regressive_inference(
+                tokenizer,
+                model,
+                x.to(device),
+                x_stamp.to(device),
+                y_stamp.to(device),
+                max_context=config['max_context'],
+                pred_len=config['pred_len'],
+                clip=config['clip'],
+                T=config['T'],
+                top_k=config['top_k'],
+                top_p=config['top_p'],
+                sample_count=config['sample_count'],
+                context_lens=context_lens,
+            )
+            # You can try commenting on this line to keep the history data
+            preds = preds[:, -config['pred_len']:, :]
 
-            for sample_indices in grouped_indices.values():
-                # 只对同长度样本做 stack，避免变长序列直接堆叠报错。
-                x_batch = torch.stack([x[i] for i in sample_indices], dim=0)
-                x_stamp_batch = torch.stack([x_stamp[i] for i in sample_indices], dim=0)
-                y_stamp_batch = torch.stack([y_stamp[i] for i in sample_indices], dim=0)
+            # The 'close' price is at index 3 in `feature_list`
+            if config['backtest_pred'] == 'close':
+                # 左侧 padding 后，最后一个时间步仍对应真实 anchor 时点。
+                last_day_close = x[:, -1, 3].numpy()
+                signals = {
+                    'last': preds[:, -1, 3] - last_day_close,
+                    'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
+                    'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
+                    'min': np.min(preds[:, :, 3], axis=1) - last_day_close,
+                }
+            elif config['backtest_pred'] == 'close_return':
+                cum_close_return = preds[:, :, 9].cumsum(axis=1)
+                signals = {
+                    'last': cum_close_return[:, -1],
+                    'mean': np.mean(cum_close_return, axis=1),
+                    'max': np.max(cum_close_return, axis=1),
+                    'min': np.min(cum_close_return, axis=1),
+                }
+            else:
+                raise ValueError(f"Unsupported backtest_pred: {config['backtest_pred']}")
 
-                preds = auto_regressive_inference(
-                    tokenizer,
-                    model,
-                    x_batch.to(device),
-                    x_stamp_batch.to(device),
-                    y_stamp_batch.to(device),
-                    max_context=config['max_context'],
-                    pred_len=config['pred_len'],
-                    clip=config['clip'],
-                    T=config['T'],
-                    top_k=config['top_k'],
-                    top_p=config['top_p'],
-                    sample_count=config['sample_count']
-                )
-                # You can try commenting on this line to keep the history data
-                preds = preds[:, -config['pred_len']:, :]
-
-                # The 'close' price is at index 3 in `feature_list`
-                if config['backtest_pred'] == 'close':
-                    last_day_close = x_batch[:, -1, 3].numpy()
-                    signals = {
-                        'last': preds[:, -1, 3] - last_day_close,
-                        'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
-                        'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
-                        'min': np.min(preds[:, :, 3], axis=1) - last_day_close,
-                    }
-                elif config['backtest_pred'] == 'close_return':
-                    cum_close_return = preds[:, :, 9].cumsum(axis=1)
-                    signals = {
-                        'last': cum_close_return[:, -1],
-                        'mean': np.mean(cum_close_return, axis=1),
-                        'max': np.max(cum_close_return, axis=1),
-                        'min': np.min(cum_close_return, axis=1),
-                    }
-                else:
-                    raise ValueError(f"Unsupported backtest_pred: {config['backtest_pred']}")
-
-                # local_idx 是分组内下标，sample_idx 是原 batch 下标；
-                # 用 sample_idx 回到 symbols/timestamps，保证记录不串位。
-                for local_idx, sample_idx in enumerate(sample_indices):
-                    for sig_type, sig_values in signals.items():
-                        results[sig_type].append((timestamps[sample_idx], symbols[sample_idx], sig_values[local_idx]))
+            for i in range(len(symbols)):
+                for sig_type, sig_values in signals.items():
+                    results[sig_type].append((timestamps[i], symbols[i], sig_values[i]))
 
     if world_size > 1 and dist.is_initialized():
         gathered_results = [None] * world_size
@@ -476,8 +478,8 @@ def main():
     # --- 2. Load Data ---
     split_paths = [
         # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
-        ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
-        # ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
+        # ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+        ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
     ]
     split_data = {}
     for split_name, split_path in split_paths:

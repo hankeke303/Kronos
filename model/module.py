@@ -315,7 +315,6 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query.device)
 
     if is_causal:
-        assert attn_mask is None
         temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(query.device)
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
@@ -332,6 +331,8 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         attn_weight += attn_mask_bias
 
     attn_weight = torch.softmax(attn_weight, dim=-1)
+    # 如果某一行全部被 mask，softmax 会产生 NaN；这里统一清零避免后续传播。
+    attn_weight = torch.nan_to_num(attn_weight, nan=0.0, posinf=0.0, neginf=0.0)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=training)
     return attn_weight @ value
 
