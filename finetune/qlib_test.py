@@ -51,6 +51,10 @@ class QlibTestDataset(Dataset):
         self.indices = []
         self.backtest_start = pd.Timestamp(config.backtest_time_range[0])
         self.backtest_end = pd.Timestamp(config.backtest_time_range[1])
+        # 可选项：允许在序列最开始时使用“短上下文”。
+        # 关闭时：必须至少有 lookback_window 个历史点才会生成该时点信号。
+        # 开启时：允许上下文从该股票数据起点开始，一直到当前锚点。
+        self.allow_partial_context = getattr(config, "backtest_allow_partial_context", False)
         
         self.data = calc_extra_features(self.data)
 
@@ -65,12 +69,35 @@ class QlibTestDataset(Dataset):
             df['month'] = df['datetime'].dt.month
             self.data[symbol] = df  # Store preprocessed dataframe
 
-            num_samples = len(df) - self.window_size + 1
-            if num_samples > 0:
-                for i in range(num_samples):
-                    timestamp = df.iloc[i + self.config.lookback_window - 1]['datetime']
-                    if self.backtest_start <= pd.Timestamp(timestamp) <= self.backtest_end:
-                        self.indices.append((symbol, i, timestamp))
+            # anchor_idx 表示“当前用于产出信号的时点”在该股票序列中的位置。
+            # 为了保证右侧未来窗口完整，需要满足：anchor_idx + predict_window < len(df)
+            # 因此可取到的最大锚点下标是 len(df) - predict_window - 1。
+            max_anchor_idx = len(df) - self.config.predict_window - 1
+            if max_anchor_idx < 0:
+                continue
+
+            # 最小锚点下标取值规则：
+            # 1) 短上下文开启：从 0 开始，表示最早时点也允许产生信号；
+            # 2) 短上下文关闭：从 lookback_window-1 开始，保持原先“必须凑满 lookback”的行为。
+            min_anchor_idx = 0 if self.allow_partial_context else self.config.lookback_window - 1
+            if min_anchor_idx > max_anchor_idx:
+                continue
+
+            # 遍历本股票所有可用于回测的锚点：
+            # 每个 anchor_idx 会映射成一个样本 (context -> future predict_window)。
+            for anchor_idx in range(min_anchor_idx, max_anchor_idx + 1):
+                timestamp = df.iloc[anchor_idx]['datetime']
+                if self.backtest_start <= pd.Timestamp(timestamp) <= self.backtest_end:
+                    # context_end 采用右开区间写法，因此需要 +1 才包含 anchor_idx 对应时点。
+                    context_end = anchor_idx + 1
+                    # context_start 是上下文左边界：
+                    # - 开启短上下文：左边界最多退到序列起点 0；
+                    # - 关闭短上下文：严格固定为 context_end - lookback_window。
+                    if self.allow_partial_context:
+                        context_start = max(0, context_end - self.config.lookback_window)
+                    else:
+                        context_start = context_end - self.config.lookback_window
+                    self.indices.append((symbol, context_start, context_end, timestamp))
 
         print(f"Filtered inference windows by backtest range [{self.backtest_start.date()} - {self.backtest_end.date()}], total samples: {len(self.indices)}")
 
@@ -78,13 +105,12 @@ class QlibTestDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int):
-        symbol, start_idx, timestamp = self.indices[idx]
+        symbol, context_start, context_end, timestamp = self.indices[idx]
         df = self.data[symbol]
 
-        context_end = start_idx + self.config.lookback_window
         predict_end = context_end + self.config.predict_window
 
-        context_df = df.iloc[start_idx:context_end]
+        context_df = df.iloc[context_start:context_end]
         predict_df = df.iloc[context_end:predict_end]
 
         x = context_df[self.feature_list].values.astype(np.float32)
@@ -96,7 +122,8 @@ class QlibTestDataset(Dataset):
         x = (x - x_mean) / (x_std + 1e-5)
         x = np.clip(x, -self.config.clip, self.config.clip)
 
-        return torch.from_numpy(x), torch.from_numpy(x_stamp), torch.from_numpy(y_stamp), symbol, timestamp
+        context_len = context_end - context_start
+        return torch.from_numpy(x), torch.from_numpy(x_stamp), torch.from_numpy(y_stamp), symbol, timestamp, context_len
 
 
 # =================================================================================
@@ -249,18 +276,13 @@ def collate_fn_for_inference(batch):
                       QlibTestDataset.__getitem__.
 
     Returns:
-        A single tuple containing the batched data.
+        A single tuple containing lists of tensors and metadata.
     """
     # Unzip the list of samples into separate lists for each data type
-    x, x_stamp, y_stamp, symbols, timestamps = zip(*batch)
+    x, x_stamp, y_stamp, symbols, timestamps, context_lens = zip(*batch)
 
-    # Stack the tensors to create a batch
-    x_batch = torch.stack(x, dim=0)
-    x_stamp_batch = torch.stack(x_stamp, dim=0)
-    y_stamp_batch = torch.stack(y_stamp, dim=0)
-
-    # Return the strings and timestamps as lists
-    return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(timestamps)
+    # Keep variable-length context windows as lists and batch later by context length.
+    return list(x), list(x_stamp), list(y_stamp), list(symbols), list(timestamps), list(context_lens)
 
 
 def generate_predictions(
@@ -309,37 +331,62 @@ def generate_predictions(
 
     results = defaultdict(list)
     with torch.no_grad():
-        for x, x_stamp, y_stamp, symbols, timestamps in tqdm(loader, desc="Inference", disable=(rank != 0)):
-            preds = auto_regressive_inference(
-                tokenizer, model, x.to(device), x_stamp.to(device), y_stamp.to(device),
-                max_context=config['max_context'], pred_len=config['pred_len'], clip=config['clip'],
-                T=config['T'], top_k=config['top_k'], top_p=config['top_p'], sample_count=config['sample_count']
-            )
-            # You can try commenting on this line to keep the history data
-            preds = preds[:, -config['pred_len']:, :]
+        for x, x_stamp, y_stamp, symbols, timestamps, context_lens in tqdm(loader, desc="Inference", disable=(rank != 0)):
+            # 同一个 DataLoader batch 内，样本可能来自不同锚点，context_len 可能不一致。
+            # 这里按 context_len 分组，保证每次送入模型的一组样本长度一致。
+            grouped_indices = defaultdict(list)
+            for sample_idx, context_len in enumerate(context_lens):
+                # sample_idx: 当前样本在本批次中的位置；context_len: 该样本上下文实际长度。
+                grouped_indices[int(context_len)].append(sample_idx)
 
-            # The 'close' price is at index 3 in `feature_list`
-            if config['backtest_pred'] == 'close':
-                last_day_close = x[:, -1, 3].numpy()
-                signals = {
-                    'last': preds[:, -1, 3] - last_day_close,
-                    'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
-                    'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
-                    'min':
-                     np.min(preds[:, :, 3], axis=1) - last_day_close,
-                }
-            elif config['backtest_pred'] == 'close_return':
-                cum_close_return = preds[:, :, 9].cumsum(axis=1)
-                signals = {
-                    'last': cum_close_return[:, -1],
-                    'mean': np.mean(cum_close_return, axis=1),
-                    'max': np.max(cum_close_return, axis=1),
-                    'min': np.min(cum_close_return, axis=1),
-                }
+            for sample_indices in grouped_indices.values():
+                # 只对同长度样本做 stack，避免变长序列直接堆叠报错。
+                x_batch = torch.stack([x[i] for i in sample_indices], dim=0)
+                x_stamp_batch = torch.stack([x_stamp[i] for i in sample_indices], dim=0)
+                y_stamp_batch = torch.stack([y_stamp[i] for i in sample_indices], dim=0)
 
-            for i in range(len(symbols)):
-                for sig_type, sig_values in signals.items():
-                    results[sig_type].append((timestamps[i], symbols[i], sig_values[i]))
+                preds = auto_regressive_inference(
+                    tokenizer,
+                    model,
+                    x_batch.to(device),
+                    x_stamp_batch.to(device),
+                    y_stamp_batch.to(device),
+                    max_context=config['max_context'],
+                    pred_len=config['pred_len'],
+                    clip=config['clip'],
+                    T=config['T'],
+                    top_k=config['top_k'],
+                    top_p=config['top_p'],
+                    sample_count=config['sample_count']
+                )
+                # You can try commenting on this line to keep the history data
+                preds = preds[:, -config['pred_len']:, :]
+
+                # The 'close' price is at index 3 in `feature_list`
+                if config['backtest_pred'] == 'close':
+                    last_day_close = x_batch[:, -1, 3].numpy()
+                    signals = {
+                        'last': preds[:, -1, 3] - last_day_close,
+                        'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
+                        'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
+                        'min': np.min(preds[:, :, 3], axis=1) - last_day_close,
+                    }
+                elif config['backtest_pred'] == 'close_return':
+                    cum_close_return = preds[:, :, 9].cumsum(axis=1)
+                    signals = {
+                        'last': cum_close_return[:, -1],
+                        'mean': np.mean(cum_close_return, axis=1),
+                        'max': np.max(cum_close_return, axis=1),
+                        'min': np.min(cum_close_return, axis=1),
+                    }
+                else:
+                    raise ValueError(f"Unsupported backtest_pred: {config['backtest_pred']}")
+
+                # local_idx 是分组内下标，sample_idx 是原 batch 下标；
+                # 用 sample_idx 回到 symbols/timestamps，保证记录不串位。
+                for local_idx, sample_idx in enumerate(sample_indices):
+                    for sig_type, sig_values in signals.items():
+                        results[sig_type].append((timestamps[sample_idx], symbols[sample_idx], sig_values[local_idx]))
 
     if world_size > 1 and dist.is_initialized():
         gathered_results = [None] * world_size
@@ -416,6 +463,7 @@ def main():
         # New added by ZMJ
         # =================================================================
         'backtest_pred': base_config.backtest_pred,
+        'allow_partial_context': getattr(base_config, 'backtest_allow_partial_context', False),
     }
 
     if rank == 0:

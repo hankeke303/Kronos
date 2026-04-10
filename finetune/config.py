@@ -235,6 +235,10 @@ class Config:
         self.inference_sample_count = 5
         self.backtest_batch_size = 1000
         self.backtest_benchmark = self._set_benchmark(self.instrument)
+        # 是否允许在序列起始阶段使用“不满 lookback_window 的上下文”。
+        # False: 与原逻辑一致，必须凑满 lookback_window 才会产出该时点的信号。
+        # True: 允许从数据起点截取到当前锚点，尽早生成信号，减少开头缺口。
+        self.backtest_allow_partial_context = True
         
         # =================================================================
         # New added by ZMJ
@@ -242,6 +246,10 @@ class Config:
         self.backtest_pred = 'close_return'    # supported: 'close' or 'close_return' now, 20260112
         if self.backtest_pred == 'close_return':
             self.backtest_save_folder_name += '_closereturn'
+
+        # 当开启短上下文模式时，在结果目录名打标，便于区分实验。
+        if self.backtest_allow_partial_context:
+            self.backtest_save_folder_name += '_partialctx'
             
         self.backtest_save_folder_name += "_by_data_20260409"
 
