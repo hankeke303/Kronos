@@ -17,24 +17,43 @@ def calc_extra_features(data):
     def _augment(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        # Normalize time information to a unified 'datetime' column.
+        # Normalize time information while avoiding duplicate `datetime` on reset_index().
         if "datetime" in df.columns:
-            datetime_values = df["datetime"]
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="raise")
         elif "date" in df.columns:
-            datetime_values = df["date"]
+            df["datetime"] = pd.to_datetime(df["date"], errors="raise")
         elif isinstance(df.index, pd.MultiIndex):
-            if "datetime" in df.index.names:
-                datetime_values = df.index.get_level_values("datetime")
-            elif "date" in df.index.names:
-                datetime_values = df.index.get_level_values("date")
+            index_names = list(df.index.names)
+            if "datetime" in index_names:
+                idx_frame = df.index.to_frame(index=False)
+                idx_frame["datetime"] = pd.to_datetime(idx_frame["datetime"], errors="raise")
+                df.index = pd.MultiIndex.from_frame(idx_frame[index_names])
+            elif "date" in index_names:
+                idx_frame = df.index.to_frame(index=False)
+                idx_frame["datetime"] = pd.to_datetime(idx_frame["date"], errors="raise")
+                idx_frame = idx_frame.drop(columns=["date"])
+                index_names[index_names.index("date")] = "datetime"
+                df.index = pd.MultiIndex.from_frame(idx_frame[index_names])
             else:
                 raise KeyError("DataFrame must contain 'datetime' or 'date' column/index for time features.")
-        elif isinstance(df.index, pd.DatetimeIndex) or df.index.name in {"datetime", "date"}:
-            datetime_values = df.index
+        elif isinstance(df.index, pd.DatetimeIndex):
+            idx = pd.to_datetime(df.index, errors="raise")
+            if idx.name != "datetime":
+                idx = idx.rename("datetime")
+            df.index = idx
+        elif df.index.name in {"datetime", "date"}:
+            idx = pd.to_datetime(df.index, errors="raise")
+            df.index = idx.rename("datetime")
         else:
             raise KeyError("DataFrame must contain 'datetime' or 'date' column/index for time features.")
 
-        df["datetime"] = pd.to_datetime(datetime_values, errors="raise")
+        # 避免后续 reset_index() 时出现 "cannot insert datetime, already exists"。
+        if "datetime" in df.columns:
+            if isinstance(df.index, pd.MultiIndex) and "datetime" in df.index.names:
+                new_names = [None if name == "datetime" else name for name in df.index.names]
+                df.index = df.index.set_names(new_names)
+            elif df.index.name == "datetime":
+                df.index = df.index.rename(None)
 
         if all(col in df.columns for col in ["open_return", "close_return", "hy_open_return", "hy_close_return"]):
             # Assume features are already calculated if these columns exist.

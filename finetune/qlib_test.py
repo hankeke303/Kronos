@@ -480,8 +480,8 @@ def main():
     # --- 2. Load Data ---
     split_paths = [
         # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
-        # ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
-        ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
+        ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+        # ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
     ]
     split_data = {}
     for split_name, split_path in split_paths:
