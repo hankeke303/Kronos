@@ -137,6 +137,17 @@ class QlibBacktest:
 
     def __init__(self, config: Config):
         self.config = config
+        self.backtest_output_dir = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "outputs",
+                "backtest_results",
+                self.config.backtest_save_folder_name,
+            )
+        )
+        os.makedirs(self.backtest_output_dir, exist_ok=True)
+        self.output_txt_path = os.path.join(self.backtest_output_dir, "output.txt")
         self.initialize_qlib()
 
     def initialize_qlib(self):
@@ -144,7 +155,671 @@ class QlibBacktest:
         print("Initializing Qlib for backtesting...")
         qlib.init(provider_uri=self.config.qlib_data_path, region=REG_CN)
 
-    def run_single_backtest(self, signal_series: pd.Series) -> pd.DataFrame:
+    def _append_output_log(self, text: str):
+        with open(self.output_txt_path, 'a') as f:
+            f.write(text)
+
+    @staticmethod
+    def _safe_call(obj, method_name: str, *args):
+        fn = getattr(obj, method_name, None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sanitize_signal_name(signal_name: str) -> str:
+        keep_chars = []
+        for ch in signal_name:
+            if ch.isalnum() or ch in {"_", "-"}:
+                keep_chars.append(ch)
+            else:
+                keep_chars.append("_")
+        return "".join(keep_chars) or "signal"
+
+    @staticmethod
+    def _build_signal_rank_df(signal_series: pd.Series) -> pd.DataFrame:
+        columns = ["datetime", "instrument", "score", "score_rank", "universe_size"]
+        if signal_series is None or signal_series.empty:
+            return pd.DataFrame(columns=columns)
+
+        signal_df = signal_series.rename("score").reset_index()
+        if signal_df.shape[1] < 3:
+            return pd.DataFrame(columns=columns)
+
+        signal_df.columns = ["instrument", "datetime", "score"]
+        signal_df["datetime"] = pd.to_datetime(signal_df["datetime"], errors="coerce")
+        signal_df = signal_df.dropna(subset=["datetime"])
+
+        signal_df["score_rank"] = signal_df.groupby("datetime")["score"].rank(method="first", ascending=False)
+        signal_df["universe_size"] = signal_df.groupby("datetime")["instrument"].transform("size")
+        return signal_df[columns]
+
+    def _build_holdings_df(
+        self,
+        signal_name: str,
+        positions,
+        signal_rank_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        columns = [
+            "signal_name",
+            "datetime",
+            "instrument",
+            "amount",
+            "price",
+            "weight",
+            "market_value",
+            "hold_days",
+            "cash",
+            "account_value",
+            "score",
+            "score_rank",
+            "universe_size",
+        ]
+
+        if not isinstance(positions, dict):
+            return pd.DataFrame(columns=columns)
+
+        rows = []
+        reserved = {
+            "cash",
+            "cash_delay",
+            "today_account_value",
+            "now_account_value",
+            "account_value",
+            "accum_info",
+        }
+
+        for raw_dt, pos in sorted(positions.items(), key=lambda kv: pd.Timestamp(kv[0])):
+            dt = pd.Timestamp(raw_dt)
+
+            raw_position = getattr(pos, "position", None)
+            if raw_position is None and isinstance(pos, dict):
+                raw_position = pos.get("position", pos)
+            if not isinstance(raw_position, dict):
+                raw_position = {}
+
+            stock_meta = {}
+            for key, value in raw_position.items():
+                if not isinstance(key, str) or key in reserved:
+                    continue
+                if isinstance(value, dict):
+                    stock_meta[key] = value
+                else:
+                    stock_meta[key] = {"amount": value}
+
+            stock_list = self._safe_call(pos, "get_stock_list")
+            if stock_list is None:
+                stock_list = list(stock_meta.keys())
+
+            cash = self._safe_call(pos, "get_cash")
+            if cash is None:
+                cash = raw_position.get("cash")
+
+            account_value = self._safe_call(pos, "calculate_value")
+            if account_value is None:
+                account_value = raw_position.get("today_account_value", raw_position.get("now_account_value"))
+
+            weight_dict = self._safe_call(pos, "get_stock_weight_dict")
+            if not isinstance(weight_dict, dict):
+                weight_dict = {}
+
+            for instrument in stock_list:
+                instrument = str(instrument)
+                meta = stock_meta.get(instrument, {})
+
+                amount = self._safe_call(pos, "get_stock_amount", instrument)
+                if amount is None:
+                    amount = meta.get("amount")
+
+                price = self._safe_call(pos, "get_stock_price", instrument)
+                if price is None:
+                    price = meta.get("price")
+
+                hold_days = self._safe_call(pos, "get_stock_count", instrument)
+                if hold_days is None:
+                    hold_days = meta.get("count")
+
+                weight = weight_dict.get(instrument)
+                if weight is None:
+                    weight = meta.get("weight")
+
+                market_value = meta.get("value")
+                if market_value is None and amount is not None and price is not None:
+                    try:
+                        market_value = float(amount) * float(price)
+                    except (TypeError, ValueError):
+                        market_value = None
+
+                rows.append(
+                    {
+                        "signal_name": signal_name,
+                        "datetime": dt,
+                        "instrument": instrument,
+                        "amount": amount,
+                        "price": price,
+                        "weight": weight,
+                        "market_value": market_value,
+                        "hold_days": hold_days,
+                        "cash": cash,
+                        "account_value": account_value,
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        holdings_df = pd.DataFrame(rows)
+        if not signal_rank_df.empty:
+            holdings_df = holdings_df.merge(
+                signal_rank_df,
+                on=["datetime", "instrument"],
+                how="left",
+            )
+        else:
+            holdings_df["score"] = np.nan
+            holdings_df["score_rank"] = np.nan
+            holdings_df["universe_size"] = np.nan
+
+        return holdings_df[columns].sort_values(["datetime", "instrument"]).reset_index(drop=True)
+
+    def _build_rebalance_frames(
+        self,
+        signal_name: str,
+        holdings_df: pd.DataFrame,
+        signal_rank_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        action_columns = [
+            "signal_name",
+            "datetime",
+            "instrument",
+            "action",
+            "score",
+            "score_rank",
+            "universe_size",
+            "prev_hold_days",
+            "curr_hold_days",
+            "reason",
+        ]
+        summary_columns = [
+            "signal_name",
+            "datetime",
+            "holding_count",
+            "buy_count",
+            "sell_count",
+            "buy_list",
+            "sell_list",
+            "holding_list",
+        ]
+
+        if holdings_df.empty:
+            return pd.DataFrame(columns=action_columns), pd.DataFrame(columns=summary_columns)
+
+        holdings_df = holdings_df.copy()
+        holdings_df["datetime"] = pd.to_datetime(holdings_df["datetime"], errors="coerce")
+        holdings_df = holdings_df.dropna(subset=["datetime"])
+
+        signal_lookup = {}
+        if not signal_rank_df.empty:
+            score_ref = signal_rank_df.copy()
+            score_ref["datetime"] = pd.to_datetime(score_ref["datetime"], errors="coerce")
+            score_ref = score_ref.dropna(subset=["datetime"])
+            signal_lookup = score_ref.set_index(["datetime", "instrument"])[
+                ["score", "score_rank", "universe_size"]
+            ].to_dict("index")
+
+        hold_days_lookup = holdings_df.set_index(["datetime", "instrument"])["hold_days"].to_dict()
+
+        date_to_holdings = {
+            pd.Timestamp(dt): set(df_dt["instrument"].astype(str).tolist())
+            for dt, df_dt in holdings_df.groupby("datetime")
+        }
+        sorted_dates = sorted(date_to_holdings.keys())
+
+        action_rows = []
+        summary_rows = []
+        prev_holdings = set()
+        prev_date = None
+
+        def score_info(cur_dt: pd.Timestamp, inst: str):
+            data = signal_lookup.get((cur_dt, inst), None)
+            if data is None:
+                return np.nan, np.nan, np.nan
+            return data.get("score", np.nan), data.get("score_rank", np.nan), data.get("universe_size", np.nan)
+
+        for dt in sorted_dates:
+            current_holdings = date_to_holdings[dt]
+            buy_list = sorted(current_holdings - prev_holdings)
+            sell_list = sorted(prev_holdings - current_holdings)
+
+            summary_rows.append(
+                {
+                    "signal_name": signal_name,
+                    "datetime": dt,
+                    "holding_count": len(current_holdings),
+                    "buy_count": len(buy_list),
+                    "sell_count": len(sell_list),
+                    "buy_list": ";".join(buy_list),
+                    "sell_list": ";".join(sell_list),
+                    "holding_list": ";".join(sorted(current_holdings)),
+                }
+            )
+
+            for inst in buy_list:
+                score, rank, universe_size = score_info(dt, inst)
+                reason = "entered holdings"
+                if pd.notna(rank):
+                    rank_i = int(rank)
+                    universe_i = int(universe_size) if pd.notna(universe_size) else -1
+                    if rank_i <= self.config.backtest_n_symbol_hold:
+                        reason = (
+                            f"score rank {rank_i}/{universe_i} in topk={self.config.backtest_n_symbol_hold}, entered holdings"
+                        )
+                    else:
+                        reason = f"entered by turnover/hold constraint, rank {rank_i}/{universe_i}"
+
+                action_rows.append(
+                    {
+                        "signal_name": signal_name,
+                        "datetime": dt,
+                        "instrument": inst,
+                        "action": "BUY",
+                        "score": score,
+                        "score_rank": rank,
+                        "universe_size": universe_size,
+                        "prev_hold_days": np.nan,
+                        "curr_hold_days": hold_days_lookup.get((dt, inst), np.nan),
+                        "reason": reason,
+                    }
+                )
+
+            for inst in sell_list:
+                score, rank, universe_size = score_info(dt, inst)
+                prev_hold_days = hold_days_lookup.get((prev_date, inst), np.nan) if prev_date is not None else np.nan
+                reason = "removed from holdings"
+                if pd.notna(rank):
+                    rank_i = int(rank)
+                    universe_i = int(universe_size) if pd.notna(universe_size) else -1
+                    if rank_i > self.config.backtest_n_symbol_hold:
+                        reason = (
+                            f"score rank {rank_i}/{universe_i} out of topk={self.config.backtest_n_symbol_hold}, removed"
+                        )
+                    else:
+                        reason = f"removed by n_drop/turnover control, rank {rank_i}/{universe_i}"
+                elif pd.notna(prev_hold_days) and prev_hold_days < self.config.backtest_hold_thresh:
+                    reason = (
+                        f"removed though hold_days={int(prev_hold_days)} < hold_thresh={self.config.backtest_hold_thresh}"
+                    )
+
+                action_rows.append(
+                    {
+                        "signal_name": signal_name,
+                        "datetime": dt,
+                        "instrument": inst,
+                        "action": "SELL",
+                        "score": score,
+                        "score_rank": rank,
+                        "universe_size": universe_size,
+                        "prev_hold_days": prev_hold_days,
+                        "curr_hold_days": np.nan,
+                        "reason": reason,
+                    }
+                )
+
+            prev_holdings = current_holdings
+            prev_date = dt
+
+        actions_df = pd.DataFrame(action_rows, columns=action_columns).sort_values(
+            ["datetime", "action", "instrument"]
+        )
+        summary_df = pd.DataFrame(summary_rows, columns=summary_columns).sort_values("datetime")
+        return actions_df, summary_df
+
+    def _build_holding_periods_df(
+        self,
+        signal_name: str,
+        holdings_df: pd.DataFrame,
+        signal_rank_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        columns = [
+            "signal_name",
+            "instrument",
+            "start_datetime",
+            "end_datetime",
+            "holding_days",
+            "entry_score",
+            "entry_rank",
+            "exit_score",
+            "exit_rank",
+            "avg_weight",
+            "avg_market_value",
+            "max_hold_days",
+        ]
+
+        if holdings_df.empty:
+            return pd.DataFrame(columns=columns)
+
+        signal_lookup = {}
+        if not signal_rank_df.empty:
+            score_ref = signal_rank_df.copy()
+            score_ref["datetime"] = pd.to_datetime(score_ref["datetime"], errors="coerce")
+            score_ref = score_ref.dropna(subset=["datetime"])
+            signal_lookup = score_ref.set_index(["datetime", "instrument"])[["score", "score_rank"]].to_dict("index")
+
+        df = holdings_df.copy()
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["datetime"])
+        all_dates = sorted(df["datetime"].unique())
+        date_order = {pd.Timestamp(dt): idx for idx, dt in enumerate(all_dates)}
+
+        rows = []
+        for instrument, inst_df in df.groupby("instrument"):
+            inst_df = inst_df.sort_values("datetime").copy()
+            inst_df["date_order"] = inst_df["datetime"].map(date_order)
+            inst_df["segment"] = (inst_df["date_order"].diff().fillna(1) != 1).cumsum()
+
+            for _, seg_df in inst_df.groupby("segment"):
+                start_dt = pd.Timestamp(seg_df["datetime"].iloc[0])
+                end_dt = pd.Timestamp(seg_df["datetime"].iloc[-1])
+                holding_days = int(seg_df.shape[0])
+
+                entry_info = signal_lookup.get((start_dt, instrument), {})
+                exit_info = signal_lookup.get((end_dt, instrument), {})
+
+                rows.append(
+                    {
+                        "signal_name": signal_name,
+                        "instrument": instrument,
+                        "start_datetime": start_dt,
+                        "end_datetime": end_dt,
+                        "holding_days": holding_days,
+                        "entry_score": entry_info.get("score", np.nan),
+                        "entry_rank": entry_info.get("score_rank", np.nan),
+                        "exit_score": exit_info.get("score", np.nan),
+                        "exit_rank": exit_info.get("score_rank", np.nan),
+                        "avg_weight": (
+                            pd.to_numeric(seg_df["weight"], errors="coerce").mean() if "weight" in seg_df else np.nan
+                        ),
+                        "avg_market_value": (
+                            pd.to_numeric(seg_df["market_value"], errors="coerce").mean()
+                            if "market_value" in seg_df
+                            else np.nan
+                        ),
+                        "max_hold_days": (
+                            pd.to_numeric(seg_df["hold_days"], errors="coerce").max()
+                            if "hold_days" in seg_df
+                            else np.nan
+                        ),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(rows, columns=columns).sort_values(["instrument", "start_datetime"])
+
+    @staticmethod
+    def _object_to_dataframe(obj):
+        if isinstance(obj, pd.DataFrame):
+            return obj.copy()
+        if isinstance(obj, pd.Series):
+            return obj.to_frame(name=obj.name or "value").reset_index()
+
+        for method_name in ("to_dataframe", "to_frame", "to_df"):
+            fn = getattr(obj, method_name, None)
+            if not callable(fn):
+                continue
+            try:
+                converted = fn()
+            except Exception:
+                continue
+            if isinstance(converted, pd.DataFrame):
+                return converted.copy()
+            if isinstance(converted, pd.Series):
+                return converted.to_frame(name=converted.name or "value").reset_index()
+
+        if isinstance(obj, dict):
+            try:
+                if obj and all(
+                    not isinstance(v, (dict, list, tuple, set, pd.DataFrame, pd.Series))
+                    for v in obj.values()
+                ):
+                    return pd.DataFrame([obj])
+            except Exception:
+                return None
+        return None
+
+    def _collect_indicator_frames(self, obj, source: str, frames: list, visited: set, depth: int = 0):
+        if obj is None or depth > 5:
+            return
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        df = self._object_to_dataframe(obj)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append((source, df))
+            return
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                self._collect_indicator_frames(value, f"{source}.{key}", frames, visited, depth + 1)
+            return
+
+        if isinstance(obj, (list, tuple)):
+            for idx, value in enumerate(obj):
+                self._collect_indicator_frames(value, f"{source}.{idx}", frames, visited, depth + 1)
+            return
+
+        for attr in (
+            "order_indicator_his",
+            "trade_indicator_his",
+            "order_history",
+            "trade_history",
+            "history",
+            "records",
+            "indicator",
+            "indicators",
+        ):
+            if not hasattr(obj, attr):
+                continue
+            try:
+                value = getattr(obj, attr)
+            except Exception:
+                continue
+            self._collect_indicator_frames(value, f"{source}.{attr}", frames, visited, depth + 1)
+
+    def _build_indicator_raw_df(self, signal_name: str, indicator_data) -> pd.DataFrame:
+        frames = []
+        self._collect_indicator_frames(indicator_data, "indicator", frames, visited=set(), depth=0)
+
+        if not frames:
+            return pd.DataFrame(columns=["signal_name", "source", "datetime", "instrument"])
+
+        normalized = []
+        for source, df in frames:
+            cur_df = df.copy()
+            if not isinstance(cur_df.index, pd.RangeIndex):
+                cur_df = cur_df.reset_index()
+
+            for old_name in ("date", "trade_date", "time", "index"):
+                if old_name in cur_df.columns and "datetime" not in cur_df.columns:
+                    cur_df = cur_df.rename(columns={old_name: "datetime"})
+            for old_name in ("stock_id", "symbol", "ticker", "code"):
+                if old_name in cur_df.columns and "instrument" not in cur_df.columns:
+                    cur_df = cur_df.rename(columns={old_name: "instrument"})
+
+            if "datetime" in cur_df.columns:
+                cur_df["datetime"] = pd.to_datetime(cur_df["datetime"], errors="coerce")
+
+            cur_df["signal_name"] = signal_name
+            cur_df["source"] = source
+            normalized.append(cur_df)
+
+        if not normalized:
+            return pd.DataFrame(columns=["signal_name", "source", "datetime", "instrument"])
+        return pd.concat(normalized, axis=0, ignore_index=True, sort=False)
+
+    @staticmethod
+    def _normalize_direction(value):
+        if pd.isna(value):
+            return np.nan
+        value_str = str(value).strip().lower()
+        if value_str in {"buy", "b", "long", "1", "true"}:
+            return "BUY"
+        if value_str in {"sell", "s", "short", "-1", "false"}:
+            return "SELL"
+        return np.nan
+
+    def _build_trade_detail_df(
+        self,
+        signal_name: str,
+        indicator_raw_df: pd.DataFrame,
+        actions_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        columns = [
+            "signal_name",
+            "datetime",
+            "instrument",
+            "action",
+            "deal_amount",
+            "trade_price",
+            "trade_value",
+            "cost",
+            "ffr",
+            "pa",
+            "trade_reason",
+            "trade_source",
+        ]
+
+        rename_alias = {
+            "deal_amount": ["deal_amount", "amount", "volume", "trade_amount", "filled_amount"],
+            "trade_price": ["trade_price", "price", "deal_price", "avg_price"],
+            "trade_value": ["trade_value", "value", "deal_value", "turnover"],
+            "cost": ["cost", "transaction_cost", "fee", "commission"],
+            "ffr": ["ffr", "fulfill_rate", "fill_rate"],
+            "pa": ["pa", "price_advantage"],
+            "direction": ["direction", "side", "order_dir", "buy_or_sell"],
+            "reason": ["reason", "message", "msg", "note", "desc"],
+        }
+
+        trade_frames = []
+        if not indicator_raw_df.empty:
+            for source_name, df_src in indicator_raw_df.groupby("source"):
+                cur_df = df_src.copy()
+
+                for target_name, alias_list in rename_alias.items():
+                    if target_name in cur_df.columns:
+                        continue
+                    for alias in alias_list:
+                        if alias in cur_df.columns:
+                            cur_df = cur_df.rename(columns={alias: target_name})
+                            break
+
+                if "datetime" in cur_df.columns:
+                    cur_df["datetime"] = pd.to_datetime(cur_df["datetime"], errors="coerce")
+
+                has_inst = "instrument" in cur_df.columns
+                has_trade_info = any(col in cur_df.columns for col in ["deal_amount", "trade_value", "trade_price"]) 
+                if not (has_inst and has_trade_info):
+                    continue
+
+                direction = cur_df["direction"].apply(self._normalize_direction) if "direction" in cur_df else np.nan
+                if isinstance(direction, pd.Series):
+                    action = direction
+                else:
+                    action = pd.Series(np.nan, index=cur_df.index)
+
+                if "deal_amount" in cur_df.columns:
+                    deal_amount_num = pd.to_numeric(cur_df["deal_amount"], errors="coerce")
+                    action = action.where(action.notna(), np.where(deal_amount_num >= 0, "BUY", "SELL"))
+
+                frame = pd.DataFrame(
+                    {
+                        "signal_name": signal_name,
+                        "datetime": cur_df["datetime"] if "datetime" in cur_df else pd.NaT,
+                        "instrument": cur_df["instrument"].astype(str),
+                        "action": action,
+                        "deal_amount": cur_df["deal_amount"] if "deal_amount" in cur_df else np.nan,
+                        "trade_price": cur_df["trade_price"] if "trade_price" in cur_df else np.nan,
+                        "trade_value": cur_df["trade_value"] if "trade_value" in cur_df else np.nan,
+                        "cost": cur_df["cost"] if "cost" in cur_df else np.nan,
+                        "ffr": cur_df["ffr"] if "ffr" in cur_df else np.nan,
+                        "pa": cur_df["pa"] if "pa" in cur_df else np.nan,
+                        "trade_reason": cur_df["reason"] if "reason" in cur_df else np.nan,
+                        "trade_source": source_name,
+                    }
+                )
+                trade_frames.append(frame)
+
+        if trade_frames:
+            trade_df = pd.concat(trade_frames, axis=0, ignore_index=True, sort=False)
+            trade_df = trade_df.dropna(subset=["datetime", "instrument"], how="any")
+            trade_df = trade_df.sort_values(["datetime", "instrument", "action"]).reset_index(drop=True)
+            return trade_df[columns]
+
+        # Fallback: no indicator trade details extracted, use position-diff actions.
+        if actions_df.empty:
+            return pd.DataFrame(columns=columns)
+
+        fallback_df = actions_df.copy()
+        fallback_df["signal_name"] = signal_name
+        fallback_df["deal_amount"] = np.nan
+        fallback_df["trade_price"] = np.nan
+        fallback_df["trade_value"] = np.nan
+        fallback_df["cost"] = np.nan
+        fallback_df["ffr"] = np.nan
+        fallback_df["pa"] = np.nan
+        fallback_df["trade_reason"] = fallback_df.get("reason", np.nan)
+        fallback_df["trade_source"] = "position_diff_fallback"
+        return fallback_df[columns].sort_values(["datetime", "instrument", "action"]).reset_index(drop=True)
+
+    def _export_trace_files(
+        self,
+        signal_name: str,
+        signal_series: pd.Series,
+        report_df: pd.DataFrame,
+        positions,
+        indicator_data=None,
+    ) -> dict[str, str]:
+        signal_rank_df = self._build_signal_rank_df(signal_series)
+        holdings_df = self._build_holdings_df(signal_name, positions, signal_rank_df)
+        actions_df, summary_df = self._build_rebalance_frames(signal_name, holdings_df, signal_rank_df)
+        periods_df = self._build_holding_periods_df(signal_name, holdings_df, signal_rank_df)
+        indicator_raw_df = self._build_indicator_raw_df(signal_name, indicator_data)
+        trade_detail_df = self._build_trade_detail_df(signal_name, indicator_raw_df, actions_df)
+
+        safe_signal_name = self._sanitize_signal_name(signal_name)
+        holdings_path = os.path.join(self.backtest_output_dir, f"holdings_snapshot_{safe_signal_name}.csv")
+        actions_path = os.path.join(self.backtest_output_dir, f"rebalance_actions_{safe_signal_name}.csv")
+        summary_path = os.path.join(self.backtest_output_dir, f"rebalance_summary_{safe_signal_name}.csv")
+        periods_path = os.path.join(self.backtest_output_dir, f"holding_periods_{safe_signal_name}.csv")
+        indicator_raw_path = os.path.join(self.backtest_output_dir, f"indicator_raw_{safe_signal_name}.csv")
+        trade_detail_path = os.path.join(self.backtest_output_dir, f"trade_details_{safe_signal_name}.csv")
+        return_curve_path = os.path.join(self.backtest_output_dir, f"return_curve_{safe_signal_name}.csv")
+
+        holdings_df.to_csv(holdings_path, index=False)
+        actions_df.to_csv(actions_path, index=False)
+        summary_df.to_csv(summary_path, index=False)
+        periods_df.to_csv(periods_path, index=False)
+        indicator_raw_df.to_csv(indicator_raw_path, index=False)
+        trade_detail_df.to_csv(trade_detail_path, index=False)
+        report_df.to_csv(return_curve_path, index=True)
+
+        return {
+            "holdings": holdings_path,
+            "actions": actions_path,
+            "summary": summary_path,
+            "periods": periods_path,
+            "indicator_raw": indicator_raw_path,
+            "trade_detail": trade_detail_path,
+            "return_curve": return_curve_path,
+        }
+
+    def run_single_backtest(self, signal_series: pd.Series, signal_name: str) -> tuple[pd.DataFrame, dict[str, str]]:
         """
         Runs a single backtest for a given prediction signal.
 
@@ -152,7 +827,8 @@ class QlibBacktest:
             signal_series (pd.Series): A pandas Series with a MultiIndex
                                        (instrument, datetime) and prediction scores.
         Returns:
-            pd.DataFrame: A DataFrame containing the performance report.
+            tuple[pd.DataFrame, dict[str, str]]:
+                A cumulative return DataFrame and exported trace file paths.
         """
         strategy = TopkDropoutStrategy(
             topk=self.config.backtest_n_symbol_hold,
@@ -177,9 +853,24 @@ class QlibBacktest:
             "executor": executor.SimulatorExecutor(**executor_config),
         }
 
-        portfolio_metric_dict, _ = backtest(strategy=strategy, **backtest_config)
+        portfolio_metric_dict, indicator_dict = backtest(strategy=strategy, **backtest_config)
         analysis_freq = "{0}{1}".format(*Freq.parse("day"))
-        report, _ = portfolio_metric_dict.get(analysis_freq)
+        report, positions = portfolio_metric_dict.get(analysis_freq)
+        indicator_data = indicator_dict.get(analysis_freq) if isinstance(indicator_dict, dict) else indicator_dict
+
+        report_df = pd.DataFrame({
+            "cum_bench": report["bench"].cumsum(),
+            "cum_return_w_cost": (report["return"] - report["cost"]).cumsum(),
+            "cum_ex_return_w_cost": (report["return"] - report["bench"] - report["cost"]).cumsum(),
+        })
+
+        trace_file_paths = self._export_trace_files(
+            signal_name,
+            signal_series,
+            report_df,
+            positions,
+            indicator_data=indicator_data,
+        )
 
         # --- Analysis and Reporting ---
         analysis = {
@@ -191,23 +882,102 @@ class QlibBacktest:
         print("\nExcess Return (w/o cost):", analysis["excess_return_without_cost"], sep='\n')
         print("\nExcess Return (w/ cost):", analysis["excess_return_with_cost"], sep='\n')
 
-        report_df = pd.DataFrame({
-            "cum_bench": report["bench"].cumsum(),
-            "cum_return_w_cost": (report["return"] - report["cost"]).cumsum(),
-            "cum_ex_return_w_cost": (report["return"] - report["bench"] - report["cost"]).cumsum(),
-        })
-        
-        with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "backtest_results", self.config.backtest_save_folder_name, "output.txt")), 'a') as f:
-            f.write("\n--- Backtest Analysis ---\n")
-            f.write("Benchmark Return:\n")
-            f.write(str(risk_analysis(report["bench"], freq=analysis_freq)))
-            f.write("\n\nExcess Return (w/o cost):\n")
-            f.write(str(analysis["excess_return_without_cost"]))
-            f.write("\n\nExcess Return (w/ cost):\n")
-            f.write(str(analysis["excess_return_with_cost"]))
-            
-            f.write(f"report_df: \n{report_df}\n")
-        return report_df
+        self._append_output_log("\n--- Backtest Analysis ---\n")
+        self._append_output_log("Benchmark Return:\n")
+        self._append_output_log(str(risk_analysis(report["bench"], freq=analysis_freq)))
+        self._append_output_log("\n\nExcess Return (w/o cost):\n")
+        self._append_output_log(str(analysis["excess_return_without_cost"]))
+        self._append_output_log("\n\nExcess Return (w/ cost):\n")
+        self._append_output_log(str(analysis["excess_return_with_cost"]))
+        self._append_output_log(f"\n\nreport_df: \n{report_df}\n")
+        self._append_output_log(
+            "\nTrace files:\n"
+            f"holdings snapshot: {trace_file_paths['holdings']}\n"
+            f"rebalance actions: {trace_file_paths['actions']}\n"
+            f"rebalance summary: {trace_file_paths['summary']}\n"
+            f"holding periods: {trace_file_paths['periods']}\n"
+            f"indicator raw: {trace_file_paths['indicator_raw']}\n"
+            f"trade details: {trace_file_paths['trade_detail']}\n"
+            f"return curve: {trace_file_paths['return_curve']}\n"
+        )
+        return report_df, trace_file_paths
+
+    def _plot_rebalance_diagnostics(
+        self,
+        summary_by_signal: dict[str, pd.DataFrame],
+        trade_by_signal: dict[str, pd.DataFrame],
+        save_path: str,
+    ):
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        has_data = False
+
+        for signal_name, summary_df in summary_by_signal.items():
+            if summary_df is None or summary_df.empty:
+                continue
+
+            df = summary_df.copy()
+            if "datetime" not in df.columns:
+                continue
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df = df.dropna(subset=["datetime"]).sort_values("datetime").set_index("datetime")
+            if df.empty:
+                continue
+
+            holding_count = pd.to_numeric(df.get("holding_count", np.nan), errors="coerce")
+            buy_count = pd.to_numeric(df.get("buy_count", np.nan), errors="coerce")
+            sell_count = pd.to_numeric(df.get("sell_count", np.nan), errors="coerce")
+            turnover_proxy = (buy_count + sell_count) / holding_count.replace(0, np.nan)
+
+            axes[0].plot(df.index, holding_count, label=signal_name)
+            axes[1].plot(df.index, turnover_proxy, label=signal_name)
+            axes[2].plot(df.index, buy_count, label=f"{signal_name}_buy", alpha=0.8)
+            axes[2].plot(df.index, sell_count, label=f"{signal_name}_sell", linestyle="--", alpha=0.8)
+            has_data = True
+
+        for signal_name, trade_df in trade_by_signal.items():
+            if trade_df is None or trade_df.empty:
+                continue
+            if "datetime" not in trade_df.columns:
+                continue
+
+            df = trade_df.copy()
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df = df.dropna(subset=["datetime"])
+            if df.empty:
+                continue
+
+            trade_value = pd.to_numeric(df.get("trade_value", np.nan), errors="coerce")
+            if trade_value.notna().sum() == 0:
+                trade_value = pd.to_numeric(df.get("deal_amount", np.nan), errors="coerce").abs()
+            daily_trade_value = trade_value.groupby(df["datetime"]).sum(min_count=1)
+            axes[2].plot(daily_trade_value.index, daily_trade_value.values, label=f"{signal_name}_trade_value")
+            has_data = True
+
+        if not has_data:
+            plt.close(fig)
+            return
+
+        axes[0].set_title("Holding Count by Date")
+        axes[0].set_ylabel("Count")
+        axes[0].grid(True)
+        axes[0].legend()
+
+        axes[1].set_title("Turnover Proxy by Date")
+        axes[1].set_ylabel("(buy + sell) / holding")
+        axes[1].grid(True)
+        axes[1].legend()
+
+        axes[2].set_title("Rebalance Actions and Trade Value")
+        axes[2].set_ylabel("Actions / Value")
+        axes[2].set_xlabel("Date")
+        axes[2].grid(True)
+        axes[2].legend(ncol=2)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.show()
+
+        self._append_output_log(f"\nRebalance diagnostics figure: {save_path}\n")
 
     def run_and_plot_results(self, signals: dict[str, pd.DataFrame], save_path: str):
         """
@@ -218,6 +988,7 @@ class QlibBacktest:
                                                and values are prediction DataFrames.
         """
         return_df, ex_return_df, bench_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        summary_by_signal, trade_by_signal = {}, {}
 
         for signal_name, pred_df in signals.items():
             print(f"\nBacktesting signal: {signal_name}...")
@@ -225,16 +996,24 @@ class QlibBacktest:
             pred_series.index.names = ['datetime', 'instrument']
             pred_series = pred_series.swaplevel().sort_index()
             # 现在的 pred_series 的格式应该是左边有两列，第一列是不同的 instrument，每个 instrument 下面是不同的 datetime 列出，内容只有一栏 score
-            
-            with open(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "backtest_results", self.config.backtest_save_folder_name, "output.txt")), 'a') as f:
-                f.write(f"\nBacktesting signal: {signal_name}...\n")
-            
-            report_df = self.run_single_backtest(pred_series)
+
+            self._append_output_log(f"\nBacktesting signal: {signal_name}...\n")
+
+            report_df, trace_file_paths = self.run_single_backtest(pred_series, signal_name)
 
             return_df[signal_name] = report_df['cum_return_w_cost']
             ex_return_df[signal_name] = report_df['cum_ex_return_w_cost']
             if 'return' not in bench_df:
                 bench_df['return'] = report_df['cum_bench']
+
+            try:
+                summary_by_signal[signal_name] = pd.read_csv(trace_file_paths["summary"])
+            except Exception:
+                summary_by_signal[signal_name] = pd.DataFrame()
+            try:
+                trade_by_signal[signal_name] = pd.read_csv(trace_file_paths["trade_detail"])
+            except Exception:
+                trade_by_signal[signal_name] = pd.DataFrame()
 
         # Plotting results
         fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
@@ -253,6 +1032,14 @@ class QlibBacktest:
         img_path = save_path
         plt.savefig(img_path, dpi=200)
         plt.show()
+
+        diag_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(save_path),
+                f"rebalance_diagnostics_{self.config.backtest_save_folder_name}.png",
+            )
+        )
+        self._plot_rebalance_diagnostics(summary_by_signal, trade_by_signal, diag_path)
 
 
 # =================================================================================
@@ -480,8 +1267,9 @@ def main():
     # --- 2. Load Data ---
     split_paths = [
         # ("val", os.path.join(run_config['data_path'], "val_data.pkl")),
-        ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
+        # ("test", os.path.join(run_config['data_path'], "test_data.pkl")),
         # ("test", "/home/fanjiahao/workspace/kronos/20260409/kronos_12d_runtime_backtest_real_20240701_20251107.pkl"),
+        ("test", "/home/fanjiahao/quant-resource/20260414/kronos_12d_runtime_backtest_real_20240102_20260414.pkl"),
     ]
     split_data = {}
     for split_name, split_path in split_paths:
