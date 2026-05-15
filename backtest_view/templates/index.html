@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kronos Backtest Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <div class="bg-shape bg-shape-a"></div>
+  <div class="bg-shape bg-shape-b"></div>
+
+  <main class="layout">
+    <header class="hero panel">
+      <div>
+        <p class="eyebrow">Kronos · Backtest View</p>
+        <h1>回测结果可视化控制台</h1>
+        <p class="subtitle">自动扫描 outputs/backtest_results 下所有子目录，按目录与信号查看持仓、调仓、成交和持仓区间诊断。</p>
+      </div>
+
+      <form id="filters" method="get" class="filters">
+        <label>
+          <span>回测目录</span>
+          <select name="run" onchange="document.getElementById('filters').submit()">
+            {% for run in runs %}
+              <option value="{{ run.name }}" {% if run.name == selected_run %}selected{% endif %}>{{ run.name }} · {{ run.mtime_text }} · signals={{ run.signal_count }}</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        <label>
+          <span>信号</span>
+          <select name="signal" onchange="document.getElementById('filters').submit()">
+            {% for signal in signals %}
+              <option value="{{ signal }}" {% if signal == selected_signal %}selected{% endif %}>{{ signal }}</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        <button type="submit">刷新视图</button>
+      </form>
+    </header>
+
+    <section class="stats">
+      {% for card in stat_cards %}
+      <article class="stat-card panel">
+        <div class="stat-label">{{ card.label }}</div>
+        <div class="stat-value">{{ card.value }}</div>
+      </article>
+      {% endfor %}
+    </section>
+
+    <section class="trend-detail-stack">
+      <article class="panel" id="return-trend-panel" data-run="{{ selected_run_safe }}" data-signal="{{ selected_signal_safe }}">
+        {{ charts.return_trend | safe }}
+      </article>
+      <article class="panel detail-panel">
+        <h2>日期联动明细</h2>
+        <p class="hint">点击上方收益趋势图上的任意日期点，可查看当天或最近交易日的持仓与调仓信息。</p>
+        <div id="date-detail-content" class="detail-content">
+          <p class="hint">等待选择日期...</p>
+        </div>
+      </article>
+    </section>
+
+    <section class="charts">
+      <article class="panel chart-wide">{{ charts.turnover | safe }}</article>
+      <article class="panel">{{ charts.trade | safe }}</article>
+      <article class="panel">{{ charts.period | safe }}</article>
+      <article class="panel chart-wide">{{ charts.holdings | safe }}</article>
+    </section>
+
+    <section class="panel contrib-panel">
+      <h2>个股收益贡献排名</h2>
+      <p class="hint">支持全区间或自定义日期区间。贡献额为近似估算：前一日持仓数量 × 当日价格变动。</p>
+      <div class="contrib-controls">
+        <label>
+          <span>开始日期</span>
+          <input type="date" id="contrib-start" />
+        </label>
+        <label>
+          <span>结束日期</span>
+          <input type="date" id="contrib-end" />
+        </label>
+        <button type="button" id="contrib-btn">计算贡献排名</button>
+      </div>
+      <div id="contrib-summary" class="hint"></div>
+      <div id="contrib-content" class="detail-grid">
+        <p class="hint">等待计算...</p>
+      </div>
+    </section>
+
+    <section class="panel log-panel">
+      <h2>日志依据片段</h2>
+      {% if log_block %}
+      <pre>{{ log_block }}</pre>
+      {% else %}
+      <p class="hint">没有在 output.txt 中解析到当前信号对应日志片段。</p>
+      {% endif %}
+    </section>
+  </main>
+
+  <script>
+    const detailRoot = document.getElementById("date-detail-content");
+    const contribRoot = document.getElementById("contrib-content");
+    const contribSummary = document.getElementById("contrib-summary");
+    const returnPanel = document.getElementById("return-trend-panel");
+    const runName = returnPanel ? returnPanel.dataset.run : "";
+    const signalName = returnPanel ? returnPanel.dataset.signal : "";
+
+    const COLUMN_LABELS = {
+      rank: "排名",
+      datetime: "时间",
+      instrument: "股票代码",
+      instrument_name: "股票名称",
+      amount: "持仓份数",
+      price: "最新价格",
+      market_value: "持仓市值",
+      action: "动作",
+      reason: "依据",
+      score_rank: "信号排名",
+      weight: "持仓权重",
+      holding_duration_days: "持仓天数",
+      holding_pnl: "本次持仓收益",
+      holding_start_date: "持仓开始日",
+      prev_amount: "调仓前份数",
+      curr_amount: "调仓后份数",
+      delta_amount: "份数变化",
+      trade_shares: "本次交易份数",
+      trade_amount: "本次交易金额",
+      cash_flow: "资金变动",
+      contribution: "贡献额",
+      contribution_rate: "贡献率",
+      active_days: "活跃天数"
+    };
+
+    function columnLabel(key) {
+      return COLUMN_LABELS[key] || key;
+    }
+
+    function normalizeDate(rawValue) {
+      if (!rawValue) return "";
+      const dateObj = new Date(rawValue);
+      if (!Number.isNaN(dateObj.getTime())) {
+        return dateObj.toISOString().slice(0, 10);
+      }
+      return String(rawValue).slice(0, 10);
+    }
+
+    function renderSimpleTable(title, rows, columns) {
+      if (!rows || rows.length === 0) {
+        return `<div class="mini-card"><h4>${title}</h4><p class="hint">无数据</p></div>`;
+      }
+      const head = columns.map((c) => `<th>${columnLabel(c)}</th>`).join("");
+      const body = rows
+        .map((row) => {
+          const cells = columns.map((c) => `<td>${row[c] ?? ""}</td>`).join("");
+          return `<tr>${cells}</tr>`;
+        })
+        .join("");
+      return `
+        <div class="mini-card">
+          <h4>${title}</h4>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>${head}</tr></thead>
+              <tbody>${body}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+
+    async function loadDateDetail(dateText = "") {
+      if (!runName || !signalName) {
+        detailRoot.innerHTML = `<p class="hint">当前未选中有效的回测目录或信号。</p>`;
+        return;
+      }
+
+      const query = new URLSearchParams({ run: runName, signal: signalName });
+      if (dateText) query.set("date", dateText);
+
+      detailRoot.innerHTML = `<p class="hint">正在加载日期明细...</p>`;
+
+      try {
+        const resp = await fetch(`/api/date-details?${query.toString()}`);
+        const payload = await resp.json();
+        if (!resp.ok || !payload.ok) {
+          detailRoot.innerHTML = `<p class="hint">明细加载失败：${payload.error || "unknown error"}</p>`;
+          return;
+        }
+
+        const summary = payload.summary || {};
+        const summaryHtml = `
+          <div class="mini-card">
+            <h4>日期信息</h4>
+            <p><b>请求日期：</b>${payload.requested_date || "latest"}</p>
+            <p><b>匹配日期：</b>${payload.nearest_date}</p>
+            <p><b>持仓数：</b>${summary.holding_count ?? ""}</p>
+            <p><b>买入数：</b>${summary.buy_count ?? ""}</p>
+            <p><b>卖出数：</b>${summary.sell_count ?? ""}</p>
+          </div>
+        `;
+
+        const holdingsHtml = renderSimpleTable(
+          "持仓快照 (Top30)",
+          payload.holdings || [],
+          ["instrument", "instrument_name", "amount", "price", "market_value", "holding_duration_days", "holding_pnl", "holding_start_date", "weight", "score_rank"]
+        );
+        const actionsHtml = renderSimpleTable(
+          "调仓动作 (Top40)",
+          payload.actions || [],
+          ["datetime", "instrument", "instrument_name", "action", "prev_amount", "curr_amount", "delta_amount", "trade_shares", "trade_amount", "cash_flow", "score_rank", "reason"]
+        );
+
+        detailRoot.innerHTML = `
+          <div class="detail-grid detail-grid-date">
+            ${summaryHtml}
+            ${holdingsHtml}
+            ${actionsHtml}
+          </div>
+        `;
+      } catch (error) {
+        detailRoot.innerHTML = `<p class="hint">明细加载异常：${String(error)}</p>`;
+      }
+    }
+
+    async function loadContributionRanking() {
+      if (!runName || !signalName) {
+        contribRoot.innerHTML = `<p class="hint">当前未选中有效的回测目录或信号。</p>`;
+        return;
+      }
+
+      const startInput = document.getElementById("contrib-start");
+      const endInput = document.getElementById("contrib-end");
+      const start = startInput ? startInput.value : "";
+      const end = endInput ? endInput.value : "";
+
+      const query = new URLSearchParams({ run: runName, signal: signalName });
+      if (start) query.set("start", start);
+      if (end) query.set("end", end);
+
+      contribRoot.innerHTML = `<p class="hint">正在计算贡献排名...</p>`;
+
+      try {
+        const resp = await fetch(`/api/stock-contrib?${query.toString()}`);
+        const payload = await resp.json();
+        if (!resp.ok || !payload.ok) {
+          contribSummary.innerHTML = "";
+          contribRoot.innerHTML = `<p class="hint">贡献排名计算失败：${payload.error || "unknown error"}</p>`;
+          return;
+        }
+
+        const meta = payload.meta || {};
+        contribSummary.innerHTML = `
+          区间：${meta.start_date || "-"} ~ ${meta.end_date || "-"}；
+          交易日：${meta.days || 0}；
+          标的数：${meta.instrument_count || 0}；
+          总贡献额：${meta.total_contribution ?? "N/A"}
+        `;
+
+        const posHtml = renderSimpleTable(
+          "正贡献 Top30",
+          payload.top_positive || [],
+          ["instrument", "instrument_name", "contribution", "contribution_rate", "active_days"]
+        );
+        const negHtml = renderSimpleTable(
+          "负贡献 Top30",
+          payload.top_negative || [],
+          ["instrument", "instrument_name", "contribution", "contribution_rate", "active_days"]
+        );
+
+        contribRoot.innerHTML = `<div class="detail-grid">${posHtml}${negHtml}</div>`;
+      } catch (error) {
+        contribSummary.innerHTML = "";
+        contribRoot.innerHTML = `<p class="hint">贡献排名请求异常：${String(error)}</p>`;
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      const contribBtn = document.getElementById("contrib-btn");
+      if (contribBtn) {
+        contribBtn.addEventListener("click", () => loadContributionRanking());
+      }
+
+      const returnPlot = document.querySelector("#return-trend-panel .js-plotly-plot");
+      if (returnPlot) {
+        returnPlot.on("plotly_click", (eventData) => {
+          const rawX = eventData && eventData.points && eventData.points[0] ? eventData.points[0].x : "";
+          loadDateDetail(normalizeDate(rawX));
+        });
+      }
+
+      loadDateDetail("");
+      loadContributionRanking();
+    });
+  </script>
+</body>
+</html>
