@@ -81,5 +81,6 @@ Kronos-models/
 figures/backtest_result_*.png
 
 finetune/data/
+finetune/configs/
 finetune/qlib_data/
 figures/rebalance_diagnostics_finetune_backtest*.png
